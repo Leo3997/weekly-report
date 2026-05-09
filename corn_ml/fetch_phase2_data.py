@@ -21,7 +21,7 @@ CORN_BELT_STATIONS: list[dict[str, Any]] = [
     {"name": "郑州",   "lat": 34.76, "lon": 113.65},
 ]
 
-CLIMATE_YEARS = list(range(2010, 2026))
+CLIMATE_YEARS = list(range(2010, 2027))
 
 
 def _nasa_fetch(lat: float, lon: float, start: int, end: int) -> dict:

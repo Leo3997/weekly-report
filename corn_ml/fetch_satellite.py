@@ -24,11 +24,10 @@ NASA_PARAMS = (
     "GWETTOP,"          # 表层土壤水分 (0-1)
     "GWETPROF,"         # 深层土壤剖面水分 (0-1)
     "ALLSKY_SFC_SW_DWN,"  # 太阳短波辐射 (MJ/m²/day) = NDVI 驱动
-    "RH2M,"             # 2m 相对湿度 (%)
-    "EVPTRNS,"          # 蒸散发 (MJ/m²/day)
+    "RH2M"              # 2m 相对湿度 (%)
 )
 
-PARAM_NAMES = ["gwetroot", "gwettop", "gwetprof", "solar_rad", "rh2m", "evptrans"]
+PARAM_NAMES = ["GWETROOT", "GWETTOP", "GWETPROF", "ALLSKY_SFC_SW_DWN", "RH2M"]
 
 YEARS = list(range(2010, 2026))
 

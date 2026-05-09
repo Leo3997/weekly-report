@@ -39,6 +39,9 @@ def load_and_align() -> pd.DataFrame:
         os.path.join(DATA_DIR, "corn_climate_daily.csv"), dtype={"date": str}
     )
     hog = pd.read_csv(os.path.join(DATA_DIR, "hog_price_daily.csv"))
+    satellite = pd.read_csv(
+        os.path.join(DATA_DIR, "corn_satellite_daily.csv"), dtype={"date": str}
+    )
 
     futures["date"] = pd.to_datetime(futures["date"])
     cbot_corn["date"] = pd.to_datetime(cbot_corn["date"])
@@ -58,6 +61,16 @@ def load_and_align() -> pd.DataFrame:
     ]
     climate_pivoted = climate_pivoted.reset_index().rename(columns={"date_dt": "date"})
 
+    # 按站 pivot 卫星数据
+    satellite["date_dt"] = pd.to_datetime(satellite["date"], format="%Y%m%d")
+    sat_params = ["GWETROOT", "GWETTOP", "GWETPROF", "ALLSKY_SFC_SW_DWN", "RH2M"]
+    sat_pivoted = satellite.pivot_table(
+        index="date_dt", columns="station",
+        values=sat_params, aggfunc="mean",
+    )
+    sat_pivoted.columns = [f"{col[0]}_{col[1]}" for col in sat_pivoted.columns]
+    sat_pivoted = sat_pivoted.reset_index().rename(columns={"date_dt": "date"})
+
     merged = futures.merge(
         cbot_corn.rename(columns={c: f"cbot_{c}" for c in ["open", "high", "low", "close", "volume"]}),
         on="date", how="left",
@@ -68,6 +81,7 @@ def load_and_align() -> pd.DataFrame:
     )
     merged = merged.merge(spot_basis, on="date", how="left")
     merged = merged.merge(climate_pivoted, on="date", how="left")
+    merged = merged.merge(sat_pivoted, on="date", how="left")
     merged = merged.merge(hog[["date", "hog_price"]], on="date", how="left")
 
     merged = merged.sort_values("date").reset_index(drop=True)
@@ -169,6 +183,38 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     drop_cols = [c for c in df.columns if c.startswith("temp_region_") or c.startswith("precip_region_")]
     df.drop(columns=drop_cols, inplace=True, errors="ignore")
 
+    # ==================== 6个卫星特征（按区域异常） ====================
+    SAT_PARAMS = [
+        ("GWETROOT", "sm_root"),      # 根区土壤水分 → 长期干旱/湿润
+        ("GWETTOP", "sm_surf"),       # 表层土壤水分 → 播种/出苗期关键
+        ("GWETPROF", "sm_prof"),      # 剖面土壤水分
+        ("ALLSKY_SFC_SW_DWN", "srad"),  # 太阳辐射 → 光合作用强度
+        ("RH2M", "rh"),               # 相对湿度
+    ]
+
+    for param, short_name in SAT_PARAMS:
+        for region_name, stations in CLIMATE_REGIONS.items():
+            cols = [f"{param}_{s}" for s in stations if f"{param}_{s}" in df.columns]
+            if not cols:
+                continue
+            df[f"{param}_region_{region_name}"] = df[cols].mean(axis=1)
+            df[f"{short_name}_anom_{region_name}"] = _station_anomaly(
+                df[["date", f"{param}_region_{region_name}"]].rename(
+                    columns={f"{param}_region_{region_name}": f"{param}_region_{region_name}"}
+                ), f"{param}_region_{region_name}"
+            )
+
+    # 前向填充卫星异常
+    for short_name in ["sm_root", "sm_surf", "sm_prof", "srad", "rh"]:
+        for region_name in CLIMATE_REGIONS:
+            col = f"{short_name}_anom_{region_name}"
+            if col in df.columns:
+                df[col] = df[col].ffill()
+
+    # 清理中间列
+    drop_sat = [c for c in df.columns if any(c.startswith(f"{p}_region_") for p in ["GWETROOT","GWETTOP","GWETPROF","ALLSKY_SFC_SW_DWN","RH2M"])]
+    df.drop(columns=drop_sat, inplace=True, errors="ignore")
+
     # ==================== 5个交叉特征 ====================
     # 1. 复合天气压力: 高温 + 少雨 同时发生 → 比任一单独更严重
     t_cols = [f"t_anom_{r}" for r in CLIMATE_REGIONS if f"t_anom_{r}" in df.columns]
@@ -217,6 +263,11 @@ def _compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
 STATION_T_ANOM = [f"t_anom_{r}" for r in CLIMATE_REGIONS]
 STATION_P_ANOM = [f"p_anom_{r}" for r in CLIMATE_REGIONS]
 
+SAT_ANOM_COLS = []
+for sn in ["sm_root", "sm_surf", "sm_prof", "srad", "rh"]:
+    for r in CLIMATE_REGIONS:
+        SAT_ANOM_COLS.append(f"{sn}_anom_{r}")
+
 FEATURE_COLS = [
     "momentum_5d",
     "momentum_20d",
@@ -234,6 +285,7 @@ FEATURE_COLS = [
     "hog_mom_lag1",
     *STATION_T_ANOM,
     *STATION_P_ANOM,
+    *SAT_ANOM_COLS,          # ★ 10个卫星特征 (5参数 × 2区域)
     "weather_stress",
     "precip_x_oi",
     "vol_x_basis",
@@ -249,6 +301,8 @@ CORE_FEATURES = [
 for r in CLIMATE_REGIONS:
     CORE_FEATURES.append(f"t_anom_{r}")
     CORE_FEATURES.append(f"p_anom_{r}")
+    for sn in ["sm_root", "sm_surf", "sm_prof", "srad", "rh"]:
+        CORE_FEATURES.append(f"{sn}_anom_{r}")
 
 PARTIAL_FEATURES = [
     "basis", "cbot_return_5d", "corn_wheat_ratio",
