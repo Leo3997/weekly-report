@@ -16,6 +16,22 @@ import numpy as np
 import pandas as pd
 import requests
 
+_ENV_FILES = [
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "corn_weekly_report", ".env"),
+]
+for _ef in _ENV_FILES:
+    if os.path.exists(_ef):
+        try:
+            with open(_ef, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        os.environ.setdefault(k.strip(), v.strip())
+        except Exception:
+            pass
+
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -457,7 +473,7 @@ def generate_final_report(feature_names, ai_weights, ai_reasoning, ai_summary,
         lines += ["", "【真实新闻情报 (akshare/东方财富)】", news_brief[:2000]]
     lines += ["", "─" * 68,
               f"  新闻来源: akshare stock_news_em (6只农业股, 真实+时间戳)",
-              f"  分析引擎: DeepSeek API",
+              f"  分析引擎: {'DeepSeek API' if used_ai else '规则引擎 (离线模式)'}",
               "─" * 68]
     return "\n".join(lines)
 

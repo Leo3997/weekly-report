@@ -79,6 +79,11 @@ def main():
         print("[离线模式] 使用季节规则引擎分配权重")
         live_data = get_live_anomaly_data()
         print(f"  ✓ 已读取实测数据 (供报告展示)")
+
+        print("[离线模式] 正在抓取真实新闻 (akshare) ...")
+        news_brief = fetch_news_brief()
+        print(f"  {'✓' if news_brief else '✗'} {'已获取' if news_brief else '失败'}")
+
         ai_weights = rule_based_weights(FEATURE_COLS, seasonal_info)
 
     print()
