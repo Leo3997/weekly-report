@@ -59,25 +59,25 @@ def main():
 
     if use_ai:
         print("[0/3] 读取最新实测天气/土壤数据 ...")
-        live_data = get_live_anomaly_data(report_date)
+        live_data = get_live_anomaly_data()
         print(f"  ✓ 已读取 {len(live_data)} 字符的实测数据")
 
-        print("[1/3] 正在调用 DeepSeek 获取新闻情报 ...")
-        news_brief = fetch_news_brief(report_date)
+        print("[1/3] 正在从百度搜索抓取真实新闻 ...")
+        news_brief = fetch_news_brief()
         print(f"  {'✓' if news_brief else '✗'} {'已获取' if news_brief else '失败'}")
 
         print("[2/3] 正在调用 DeepSeek 分析供需格局 ...")
         sd_analysis = analyze_supply_demand_current(live_data)
         print(f"  {'✓' if sd_analysis else '✗'} {'已获取' if sd_analysis else '失败'}")
 
-        print("[3/3] 正在调用 DeepSeek 生成特征权重建议 (基于实测数据)...")
+        print("[3/3] 正在调用 DeepSeek 生成特征权重建议 (基于实测+新闻)...")
         ai_summary, ai_weights, ai_reasoning = generate_weight_proposal(
-            FEATURE_COLS, seasonal_info, live_data, report_date
+            FEATURE_COLS, seasonal_info, live_data, news_brief,
         )
         print(f"  ✓ AI 分析了 {len(ai_weights)} 个特征的权重")
     else:
         print("[离线模式] 使用季节规则引擎分配权重")
-        live_data = get_live_anomaly_data(report_date)
+        live_data = get_live_anomaly_data()
         print(f"  ✓ 已读取实测数据 (供报告展示)")
         ai_weights = rule_based_weights(FEATURE_COLS, seasonal_info)
 

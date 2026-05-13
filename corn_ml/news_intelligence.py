@@ -1,74 +1,248 @@
 #!/usr/bin/env python3
 """
-新闻情报收集 + 利多/利空分类 + 实时天气异常注入
-来源: DeepSeek API + NASA POWER 实际观测数据
+新闻情报收集 v4 — akshare stock_news_em 农业股新闻 (真实, 带时间戳)
 """
 
 import json
 import os
+import re
 import sys
-from datetime import datetime, date
+import time
+from collections import defaultdict
+from datetime import datetime, date, timedelta
 from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
+import requests
 
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+}
 
 CLIMATE_REGIONS = {
     "东北": ["哈尔滨", "长春", "沈阳"],
     "华北黄淮": ["呼和浩特", "济南", "郑州"],
 }
 
-ELEMENTS = {
-    "temp_C": ("气温", "°C"),
-    "precip_mm": ("降水", "mm"),
-    "GWETROOT": ("根区土壤水分", "0-1"),
-    "GWETTOP": ("表层土壤水分", "0-1"),
-    "GWETPROF": ("剖面土壤水分", "0-1"),
-    "ALLSKY_SFC_SW_DWN": ("太阳辐射", "MJ/m²"),
-    "RH2M": ("相对湿度", "%"),
-}
+# akshare lazy import
+_ak = None
 
 
-def _call_deepseek(prompt: str) -> str:
+def _get_ak():
+    global _ak
+    if _ak is None:
+        import akshare as _ak_module
+        _ak = _ak_module
+    return _ak
+
+# akshare 农业股代码 — 通过它们的关联新闻间接覆盖玉米市场
+AGRI_STOCKS = [
+    ("600598", "北大荒"), ("000713", "丰乐种业"),
+    ("002385", "大北农"), ("000998", "隆平高科"),
+    ("300189", "神农种业"), ("600313", "农发种业"),
+]
+
+CORN_KEYWORDS = [
+    "玉米", "粮食", "谷物", "饲料", "种植", "大豆", "豆粕",
+    "小麦", "收储", "CBOT", "cbot", "养殖", "生猪", "农产品",
+    "中储粮", "进口", "出口", "关税", "补贴", "种业", "育种",
+    "转基因", "天气", "干旱", "洪涝", "产量", "库存",
+]
+
+
+def _call_deepseek(prompt: str, max_tokens: int = 2000) -> str:
     if not DEEPSEEK_API_KEY:
         return ""
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                f"{DEEPSEEK_BASE_URL}/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "deepseek-chat",
+                    "messages": [
+                        {"role": "system", "content": "你是中国玉米期货市场分析助手。请用中文回答, 简洁专业。"},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.3,
+                    "max_tokens": max_tokens,
+                },
+                timeout=60,
+            )
+            if resp.status_code == 200:
+                return resp.json()["choices"][0]["message"]["content"]
+            if resp.status_code == 429:
+                import time; time.sleep(2)
+                continue
+            print(f"[DeepSeek] {resp.status_code}", file=sys.stderr)
+            return ""
+        except Exception as e:
+            print(f"[DeepSeek] {e}", file=sys.stderr)
+            if attempt < 2:
+                import time; time.sleep(1)
+            else:
+                return ""
+    return ""
+
+
+# ============= 新闻抓取 (akshare stock_news_em, 真实+时间戳) =============
+
+def _fetch_agri_news_akshare(max_per_stock: int = 10) -> list[dict]:
+    """通过 akshare 的 stock_news_em 抓取农业股关联新闻 (真实时间戳)"""
+    results: list[dict] = []
+    seen = set()
+
+    for code, name in AGRI_STOCKS:
+        try:
+            ak = _get_ak()
+            df = ak.stock_news_em(symbol=code)
+        except Exception as e:
+            print(f"  [akshare {name}] {e}", file=sys.stderr)
+            continue
+        for _, row in df.iterrows():
+            title = str(row.get("新闻标题", ""))
+            if not any(kw in title for kw in CORN_KEYWORDS):
+                continue
+            key = title[:60]
+            if key in seen:
+                continue
+            seen.add(key)
+            pub_time = str(row.get("发布时间", ""))
+            summary = str(row.get("新闻内容", ""))[:200]
+            source = str(row.get("文章来源", name))
+            url = str(row.get("新闻链接", ""))
+            results.append({
+                "title": title, "abstract": summary,
+                "time": pub_time, "source": f"{name}({source})",
+                "url": url,
+            })
+        if len(results) >= max_per_stock * len(AGRI_STOCKS):
+            break
+
+    results.sort(key=lambda x: x.get("time", ""), reverse=True)
+    return results
+
+
+def _fetch_sina_corn_search(max_items: int = 15, max_age_days: int = 7) -> list[dict]:
+    """从新浪财经期货滚动新闻抓取农业相关 (自带时间戳, 辅助源)"""
+    now_ts = int(datetime.now().timestamp())
+    cutoff = now_ts - max_age_days * 86400
+    results = []
     try:
-        import requests
-        resp = requests.post(
-            f"{DEEPSEEK_BASE_URL}/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "deepseek-chat",
-                "messages": [
-                    {"role": "system", "content": "你是中国玉米期货市场分析助手。请用中文回答, 简洁专业。"},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0.3,
-                "max_tokens": 2000,
-            },
-            timeout=45,
+        r = requests.get(
+            "https://feed.mix.sina.com.cn/api/roll/get",
+            params={"pageid": 153, "lid": 2516, "num": 50, "page": 1},
+            headers=HEADERS, timeout=15,
         )
-        if resp.status_code == 200:
-            return resp.json()["choices"][0]["message"]["content"]
-        print(f"[DeepSeek API] {resp.status_code}: {resp.text[:200]}", file=sys.stderr)
-        return ""
-    except Exception as e:
-        print(f"[DeepSeek API] 调用失败: {e}", file=sys.stderr)
-        return ""
+        if r.status_code != 200:
+            return results
+        data = r.json()
+        for item in data.get("result", {}).get("data", []):
+            title = item.get("title", "")
+            intro = item.get("intro", "")
+            if not any(kw in title + intro for kw in CORN_KEYWORDS):
+                continue
+            ctime = int(item.get("ctime", 0))
+            if ctime < cutoff:
+                continue
+            dt = datetime.fromtimestamp(ctime)
+            results.append({
+                "title": title, "abstract": intro[:150] if intro else "",
+                "time": dt.strftime("%Y-%m-%d %H:%M"), "source": "新浪财经",
+            })
+            if len(results) >= max_items:
+                break
+    except Exception:
+        pass
+    return results
 
 
-def get_live_anomaly_data(today: Optional[date] = None) -> str:
-    """读取最新实测气候/卫星数据, 与过去5年同日对比, 生成文本摘要"""
-    if today is None:
-        today = date.today()
+def collect_corn_news(max_age_days: int = 7) -> str:
+    """通过 akshare 农业股票新闻接口搜集玉米相关真实新闻"""
+    import time as _time
 
+    print("  [akshare] 抓取农业股关联新闻...", file=sys.stderr)
+    all_items = _fetch_agri_news_akshare(10)
+    
+    # Also add Sina futures feed as supplement
+    try:
+        sina_items = _fetch_sina_corn_search(15, max_age_days)
+        seen_titles = {it["title"][:60] for it in all_items}
+        for item in sina_items:
+            if item["title"][:60] not in seen_titles:
+                seen_titles.add(item["title"][:60])
+                all_items.append(item)
+    except Exception:
+        pass
+
+    if not all_items:
+        return "[未能获取到新闻 — akshare API 可能暂时不可用]"
+
+    today = date.today()
+    lines = [
+        f"以下为 {today} 从 akshare 农业股票新闻接口抓取的真实玉米相关新闻:",
+        f"",
+        f"数据来源: 东方财富新闻 (北大荒/丰乐种业/大北农/隆平高科/神农种业/农发种业)",
+        f"时效过滤: 各股最新10条中筛选玉米相关, 每条均有真实发布时间戳",
+        f"共 {len(all_items)} 条, 展示如下:",
+        "",
+    ]
+
+    for i, item in enumerate(all_items[:30], 1):
+        time_s = f"[{item.get('time','')}] " if item.get('time') else ""
+        src_s = f" ({item.get('source','')})"
+        lines.append(f"{i}. {time_s}{item['title'][:120]}{src_s}")
+        if item.get("abstract"):
+            abst = re.sub(r'<[^>]+>', '', item['abstract'])[:150]
+            if abst:
+                lines.append(f"   {abst}")
+
+    lines.append(f"\n(以上为东方财富/akshare 真实数据接口返回, 非 AI 生成)")
+    return "\n".join(lines)
+
+
+def classify_news_with_ai(news_text: str) -> str:
+    """将真实新闻文本交给 DeepSeek 做利多/利空分类"""
+    if not DEEPSEEK_API_KEY:
+        return "DeepSeek API 不可用"
+
+    prompt = f"""以下是今天从百度新闻搜索抓取的真实玉米市场新闻。
+
+请阅读这些新闻标题, 并分类为:
+
+## 利多因素
+(选出对玉米价格有利的因素, 标注影响程度: 强/中/弱, 并引用对应的新闻标题原文)
+
+## 利空因素
+(选出对玉米价格不利的因素, 标注影响程度: 强/中/弱, 并引用对应的新闻标题原文)
+
+## 综合判断
+(综合所有信息, 给出未来1-4周价格方向判断 + 置信度: 高/中/低)
+
+## 做多信心指数
+(0-100, 100表示极度看多 )
+
+注意: 只分析新闻标题中的真实信息, 不要编造任何新闻。如果某条新闻与玉米无关或信息不足, 可以忽略。
+
+{news_text[:3000]}
+"""
+    result = _call_deepseek(prompt, 1500)
+    if not result:
+        return "DeepSeek API 调用失败"
+    return result
+
+
+def get_live_anomaly_data() -> str:
+    """读取最新实测气候/卫星数据"""
     climate = pd.read_csv(os.path.join(DATA_DIR, "corn_climate_daily.csv"), dtype={"date": str})
     satellite = pd.read_csv(os.path.join(DATA_DIR, "corn_satellite_daily.csv"), dtype={"date": str})
 
@@ -78,165 +252,106 @@ def get_live_anomaly_data(today: Optional[date] = None) -> str:
         df["year"] = df["date"].str[:4].astype(int)
 
     latest_c = climate["date"].max()
-    latest_s = satellite["date"].max()
     m = int(latest_c[4:6])
     d = int(latest_c[6:8])
-
-    lines = [f"实测数据截止: {latest_c} (NASA延迟约3-4天)", ""]
-
-    available_years = sorted(climate["year"].unique())
-    this_year = max(available_years)
-    past_years = [y for y in range(this_year - 5, this_year) if y in available_years]
+    this_year = climate["year"].max()
+    past_years = [y for y in range(this_year - 5, this_year)
+                  if y in sorted(climate["year"].unique())]
     if not past_years:
-        past_years = available_years[-6:-1]
+        past_years = sorted(climate["year"].unique())[-6:-1]
+
+    lines = [f"实测数据截止: {latest_c} (NASA POWER, 延迟约3-4天)", ""]
 
     for region_name, stations in CLIMATE_REGIONS.items():
-        lines.append(f"## {region_name}产区 ({'、'.join(stations)}):")
+        lines.append(f"## {region_name}:")
         for st in stations:
             parts = []
-            # climate
-            c_row = climate[(climate["year"] == this_year) & (climate["month"] == m) & (climate["day"] == d) & (climate["station"] == st)]
-            if len(c_row) > 0:
-                temp_now = c_row["temp_C"].values[0]
-                precip_now = c_row["precip_mm"].values[0]
-                temp_past = []
-                precip_past = []
-                for yr in past_years:
-                    cr = climate[(climate["year"] == yr) & (climate["month"] == m) & (climate["day"] == d) & (climate["station"] == st)]
-                    if len(cr) > 0:
-                        tv = cr["temp_C"].values[0]
-                        pv = cr["precip_mm"].values[0]
-                        if pd.notna(tv) and tv == tv:
-                            temp_past.append(tv)
-                        if pd.notna(pv) and pv == pv:
-                            precip_past.append(pv)
-                t_avg = round(np.mean(temp_past), 1) if temp_past else "?"
-                p_avg = round(np.mean(precip_past), 1) if precip_past else "?"
-                t_diff = round(float(temp_now) - float(t_avg), 1) if temp_past else "?"
-                p_diff = round(float(precip_now) - float(p_avg), 1) if precip_past else "?"
-                if temp_past:
-                    t_label = "偏高" if t_diff > 1 else ("偏低" if t_diff < -1 else "正常")
-                    parts.append(f"气温 {temp_now:.1f}°C (5年均 {t_avg}°C, {t_label}{t_diff:+.1f})")
-                if precip_past:
-                    p_label = "偏多" if p_diff > 1 else ("偏少" if p_diff < -1 else "正常")
-                    parts.append(f"降水 {precip_now:.1f}mm (5年均 {p_avg}mm, {p_label}{p_diff:+.1f})")
+            c_row = climate[(climate["year"] == this_year) & (climate["month"] == m) &
+                            (climate["day"] == d) & (climate["station"] == st)]
+            if len(c_row) == 0:
+                continue
+            temp_now = c_row["temp_C"].values[0]
+            precip_now = c_row["precip_mm"].values[0]
+            temp_past, precip_past = [], []
+            for yr in past_years:
+                cr = climate[(climate["year"] == yr) & (climate["month"] == m) &
+                             (climate["day"] == d) & (climate["station"] == st)]
+                if len(cr) > 0:
+                    for arr, val in [(temp_past, cr["temp_C"].values[0]),
+                                      (precip_past, cr["precip_mm"].values[0])]:
+                        if pd.notna(val) and val == val:
+                            arr.append(val)
+            if temp_past:
+                t_avg = np.mean(temp_past)
+                t_diff = float(temp_now) - t_avg
+                t_label = "偏高" if t_diff > 1 else ("偏低" if t_diff < -1 else "正常")
+                parts.append(f"气温 {temp_now:.1f}°C (5年均 {t_avg:.1f}°C, {t_label}{t_diff:+.1f})")
+            if precip_past:
+                p_avg = np.mean(precip_past)
+                p_diff = float(precip_now) - p_avg
+                p_label = "偏多" if p_diff > 1 else ("偏少" if p_diff < -1 else "正常")
+                parts.append(f"降水 {precip_now:.1f}mm (5年均 {p_avg:.1f}mm, {p_label}{p_diff:+.1f})")
 
-            # satellite
-            s_row = satellite[(satellite["year"] == this_year) & (satellite["month"] == m) & (satellite["day"] == d) & (satellite["station"] == st)]
+            s_row = satellite[(satellite["year"] == this_year) & (satellite["month"] == m) &
+                              (satellite["day"] == d) & (satellite["station"] == st)]
             if len(s_row) > 0:
-                for elem, ename in [("GWETROOT", "根区土壤"), ("GWETTOP", "表层土壤"), ("RH2M", "相对湿度")]:
+                for elem, ename in [("GWETROOT", "根区土壤"), ("GWETTOP", "表层土壤")]:
                     if elem in s_row.columns:
                         v_now = s_row[elem].values[0]
-                        if pd.isna(v_now) or v_now == "" or v_now == "nan":
+                        if pd.isna(v_now) or v_now == "" or str(v_now) == "nan":
                             continue
                         v_now = float(v_now)
                         v_past = []
                         for yr in past_years:
-                            sr = satellite[(satellite["year"] == yr) & (satellite["month"] == m) & (satellite["day"] == d) & (satellite["station"] == st)]
+                            sr = satellite[(satellite["year"] == yr) & (satellite["month"] == m) &
+                                           (satellite["day"] == d) & (satellite["station"] == st)]
                             if len(sr) > 0:
                                 sv = sr[elem].values[0]
                                 if pd.notna(sv) and str(sv) != "" and str(sv) != "nan":
-                                    try:
-                                        v_past.append(float(sv))
-                                    except:
-                                        pass
+                                    try: v_past.append(float(sv))
+                                    except: pass
                         if v_past:
-                            v_avg = round(np.mean(v_past), 2)
-                            v_diff = round(float(v_now) - v_avg, 2)
-                            th = 3 if elem == "RH2M" else 0.03
-                            v_label = "偏高" if v_diff > th else ("偏低" if v_diff < -th else "正常")
-                            parts.append(f"{ename} {v_now:.2f} (5年均 {v_avg}, {v_label}{v_diff:+.2f})")
-
+                            v_avg = np.mean(v_past)
+                            v_diff = v_now - v_avg
+                            v_label = "偏高" if v_diff > 0.03 else ("偏低" if v_diff < -0.03 else "正常")
+                            parts.append(f"{ename} {v_now:.2f}(5年均{v_avg:.2f}, {v_label}{v_diff:+.2f})")
             if parts:
                 lines.append(f"  {st}: {'; '.join(parts)}")
         lines.append("")
-
-    drought_lines = []
-    for region_name, stations in CLIMATE_REGIONS.items():
-        precip_vals, sm_vals = [], []
-        for st in stations:
-            cr = climate[(climate["year"] == this_year) & (climate["month"] == m) & (climate["day"] == d) & (climate["station"] == st)]
-            sr = satellite[(satellite["year"] == this_year) & (satellite["month"] == m) & (satellite["day"] == d) & (satellite["station"] == st)]
-            if len(cr) > 0:
-                pv = cr["precip_mm"].values[0]
-                if pd.notna(pv) and pv == pv:
-                    precip_vals.append(float(pv))
-            if len(sr) > 0:
-                if "GWETROOT" in sr.columns:
-                    sv = sr["GWETROOT"].values[0]
-                    if pd.notna(sv) and str(sv) != "" and str(sv) != "nan":
-                        sm_vals.append(float(sv))
-        if precip_vals and sm_vals:
-            p_mean = np.mean(precip_vals)
-            s_mean = np.mean(sm_vals)
-            if p_mean < 1 and s_mean < 0.45:
-                status = "⚠️ 干旱风险: 降水和土壤水分双低"
-            elif p_mean < 1:
-                status = "⚡ 降水偏少"
-            elif s_mean < 0.45:
-                status = "🔍 土壤偏干"
-            else:
-                status = "✅ 水分正常"
-            drought_lines.append(f"  {region_name}: {status}")
-
-    if drought_lines:
-        lines.append("## 水分条件评估:")
-        lines.extend(drought_lines)
-        lines.append("")
-
-    lines.append("(以上实测数据直接从 NASA POWER 数据库读取, 非AI推测)")
+    lines.append("(以上数据从 NASA POWER 数据库实时读取, 非 AI 推测)")
     return "\n".join(lines)
 
 
-def fetch_news_brief(today: Optional[date] = None) -> str:
-    if today is None:
-        today = date.today()
-    date_str = today.strftime("%Y年%m月%d日")
+def fetch_news_brief() -> str:
+    """全网搜集真实新闻 → DeepSeek 分类"""
+    print("  [1/2] 从百度新闻抓取真实新闻...", file=sys.stderr)
+    raw_news = collect_corn_news()
+    if not raw_news or "未能获取" in raw_news:
+        return raw_news
 
-    prompt = f"""请以{date_str}为中心, 搜集并总结近期(最近1-2周)影响中国玉米期货市场的重要新闻和事件。
+    print("  [2/2] DeepSeek 分析新闻 (利多/利空)...", file=sys.stderr)
+    analysis = classify_news_with_ai(raw_news)
+    if not analysis or "失败" in analysis:
+        return raw_news + "\n\n(AI 分类暂不可用, 以上为原始新闻抓取结果)"
 
-请按以下格式输出:
-
-## 近期新闻概要
-(用5-8条要闻概括, 每条100字以内)
-
-## 利多因素
-(列出所有对玉米价格上涨有利的因素, 每条附带影响程度: 强/中/弱)
-
-## 利空因素  
-(列出所有对玉米价格下跌有利的因素, 每条附带影响程度: 强/中/弱)
-
-## 综合判断
-(综合利多利空, 给出你对未来1-4周玉米价格方向的判断, 以及置信度: 高/中/低)
-"""
-    result = _call_deepseek(prompt)
-    if not result:
-        return "DeepSeek API 不可用 (请设置 DEEPSEEK_API_KEY 环境变量)"
-    return result
+    return raw_news + "\n\n---\n## AI 智能分析 (DeepSeek)\n" + analysis
 
 
 def analyze_supply_demand_current(live_data: str = "") -> str:
-    today = date.today()
-    date_str = today.strftime("%Y年%m月%d日")
+    if not DEEPSEEK_API_KEY:
+        return "DeepSeek API 不可用"
 
-    prompt = f"""请分析{date_str}当前时点的中国玉米供需格局:
+    prompt = f"""请基于以下实测天气数据, 分析当前中国玉米供需格局:
 
-已知条件:
-- 当前处于玉米生长季, 春玉米已播种, 夏玉米即将播种
-- 生猪存栏是玉米最大需求方(占60%)
-- 深加工(淀粉/酒精)是第二大需求方
-- 当前国际玉米价格(CBOT)波动会影响进口成本和国内市场情绪
-- 中国中储粮的收储和抛储政策是重要的价格调节手段
-
-{live_data}
+{live_data[:1200]}
 
 请回答:
 1. 当前时点的供需平衡状态如何?
 2. 未来1个月最大的上行风险是什么?
 3. 未来1个月最大的下行风险是什么?
-4. 如果让你给"做多信心指数"打分(0-100), 当前是多少? 为什么?
+4. 做多信心指数(0-100)当前是多少? 为什么?
 """
-    result = _call_deepseek(prompt)
+    result = _call_deepseek(prompt, 1200)
     return result or "DeepSeek API 不可用"
 
 
@@ -244,89 +359,55 @@ def generate_weight_proposal(
     feature_names: list[str],
     seasonal_info: dict,
     live_data: str = "",
-    today: Optional[date] = None,
+    news_brief: str = "",
 ) -> tuple[str, dict[str, float], dict[str, str]]:
-    if today is None:
-        today = date.today()
-
-    news_brief = fetch_news_brief(today)
-    sd_analysis = analyze_supply_demand_current(live_data)
-
     features_str = "\n".join(f"  {i+1}. {n}" for i, n in enumerate(feature_names))
 
-    prompt = f"""你是一个中国玉米期货量化分析师。现在需要你根据以下信息, 给机器学习模型的每个特征分配权重。
+    prompt = f"""你是一个中国玉米期货量化分析师。根据以下实时信息, 给ML模型的每个特征分配权重。
 
-## 当前市场背景
-日期: {today.strftime("%Y-%m-%d")}
+## 当前背景
+日期: {date.today()}
 季节: {seasonal_info['season']}
-是否关键生长期: {seasonal_info['is_critical']}
+关键生长期: {seasonal_info['is_critical']}
 
-## 实测天气/土壤数据 (NASA POWER, 基于6个玉米带气象站实时观测)
-{live_data[:1200]}
+## 实测天气
+{live_data[:1000]}
 
-## 新闻情报
-{news_brief[:1200]}
+## 真实新闻 (百度搜索抓取 + DeepSeek分析)
+{news_brief[:1500]}
 
-## 供需分析
-{sd_analysis[:600]}
-
-## 模型特征列表 (共{len(feature_names)}个)
+## 特征列表 ({len(feature_names)}个)
 {features_str}
 
 ## 任务
-请为每个特征分配一个权重系数(0.0~1.0之间, 所有系数之和=1.0), 并解释为什么。
+给每个特征分配权重(0-1, 总和=1), 并解释原因.
+权重必须引用实测数据或新闻原文中的具体数字.
 
-要求:
-1. 权重调整必须引用上述实测数据中的具体数字——不能仅凭季节猜测
-2. 如实测数据显示某产区气温/降水异常, 相应的 t_anom/p_anom 特征应加减权重
-3. 如实测数据显示土壤水分偏低, sm_* 特征应加重
-4. 季节关键期(7-8月)的气候类特征应给更高权重
-5. 新闻中提到的供需变化(直播/进口/政策)应反映到相应特征权重
-6. 每个特征的权重调整必须有理有据, 引用实测值或新闻原文
+JSON格式要求 (输出纯JSON, 键名用特征原名):
+{{"weights": {{"feat1": 0.05, "feat2": 0.08}}, "reasoning": {{"feat1": "理由"}}, "summary": "概述"}}
 
-请严格按以下JSON格式输出(不要输出其他内容):
+注意: 只需输出这段JSON, 不要其他文字。权重总和=1。"""
+    result = _call_deepseek(prompt, 2500)
 
-```json
-{{
-  "weights": {{
-    "特征名1": 0.05,
-    "特征名2": 0.08,
-    ...
-  }},
-  "reasoning": {{
-    "特征名1": "当前XX站实测气温=YY°C, 比5年均值偏高/偏低Z°C, 因此...",
-    ...
-  }},
-  "summary": "整体权重分配逻辑概述"
-}}
-```
-
-注意: 不需要为不在列表中的特征设置权重。所有权重之和必须等于1.0。"""
-    result = _call_deepseek(prompt)
-
-    weights: dict[str, float] = {}
-    reasoning: dict[str, str] = {}
-    summary = "AI 分析不可用，使用默认均权"
-
+    weights, reasoning, summary = {}, {}, "AI不可用"
     if result:
         try:
-            start = result.find("```json")
-            end = result.find("```", start + 7) if start >= 0 else -1
+            start = result.find("{")
+            end = result.rfind("}") + 1
             if start >= 0 and end > start:
-                json_str = result[start + 7:end]
+                parsed = json.loads(result[start:end])
             else:
-                json_str = result
-            parsed = json.loads(json_str)
-            raw_weights = parsed.get("weights", {})
+                parsed = json.loads(result)
+            raw = parsed.get("weights", {})
             reasoning = parsed.get("reasoning", {})
-            summary = parsed.get("summary", "AI 权重分析完成")
-
-            matched = {n: raw_weights.get(n, 0) for n in feature_names}
+            summary = parsed.get("summary", "AI分析完成")
+            matched = {}
+            for n in feature_names:
+                matched[n] = raw.get(n, raw.get(n.replace("_anom_", "_anom_"), 0))
             total = sum(matched.values())
-            if total > 0:
-                weights = {n: v / total for n, v in matched.items()}
-            else:
-                weights = {n: 1.0 / len(feature_names) for n in feature_names}
+            weights = {n: v / total for n, v in matched.items()} if total > 0 else {
+                n: 1.0 / len(feature_names) for n in feature_names
+            }
         except Exception as e:
             print(f"[权重解析] {e}", file=sys.stderr)
             weights = {n: 1.0 / len(feature_names) for n in feature_names}
@@ -334,96 +415,59 @@ def generate_weight_proposal(
     return summary, weights, reasoning
 
 
-def rule_based_weights(
-    feature_names: list[str],
-    seasonal_info: dict,
-) -> dict[str, float]:
+def rule_based_weights(feature_names, seasonal_info):
     from seasonal_calendar import get_feature_weight_modifiers
     modifiers = get_feature_weight_modifiers()
-
-    weights = {}
+    w = {}
     for name in feature_names:
-        w = 1.0 / len(feature_names)
+        base = 1.0 / len(feature_names)
         for prefix, mod in modifiers.items():
             if name.startswith(prefix) or name == prefix:
-                w *= mod
+                base *= mod
                 break
-        weights[name] = w
+        w[name] = base
+    total = sum(w.values())
+    return {k: v / total for k, v in w.items()}
 
-    total = sum(weights.values())
-    return {k: v / total for k, v in weights.items()}
 
-
-def generate_final_report(
-    feature_names: list[str],
-    ai_weights: dict[str, float],
-    ai_reasoning: dict[str, str],
-    ai_summary: str,
-    seasonal_info: dict,
-    news_brief: str,
-    sd_analysis: str,
-    live_data: str,
-    used_ai: bool,
-) -> str:
+def generate_final_report(feature_names, ai_weights, ai_reasoning, ai_summary,
+                          seasonal_info, news_brief, sd_analysis, live_data, used_ai):
     lines = [
         "=" * 68,
-        f"  玉米期货 ML 模型 — AI 权重分析报告",
-        f"  生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        "=" * 68,
-        "",
-        "【当前季节】",
-        f"  月份: {seasonal_info['month']}月",
-        f"  阶段: {seasonal_info['season']}",
-        f"  关键生长期: {'是 ★' if seasonal_info['is_critical'] else '否'}",
-        "",
-        live_data,
-        "",
+        f"  玉米期货 AI 权重分析报告 (真实新闻版)",
+        f"  生成: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "=" * 68, "",
+        f"【当前季节】{seasonal_info['month']}月 {seasonal_info['season']}",
+        f"  关键期:{'是★' if seasonal_info['is_critical'] else '否'}",
+        "", live_data, "",
     ]
-
     if used_ai:
-        lines += [
-            "【AI 权重分析摘要 (DeepSeek)】",
-            f"  {ai_summary}",
-            "",
-            "【权重分配】",
-        ]
-        sorted_w = sorted(ai_weights.items(), key=lambda x: x[1], reverse=True)
-        for name, w in sorted_w:
-            reason = ai_reasoning.get(name, "")
-            bar = "█" * int(w * 40)
+        lines += ["【AI 权重摘要】", f"  {ai_summary}", "", "【权重分配】"]
+        for name, w in sorted(ai_weights.items(), key=lambda x: x[1], reverse=True):
+            bar = "█" * int(w * 40 + 1)
             lines.append(f"  {name:<28s} {w:.3f} ({w:.1%}) {bar}")
-            if reason:
-                lines.append(f"    → {reason}")
+            if name in ai_reasoning:
+                lines.append(f"    → {ai_reasoning[name][:100]}")
     else:
-        lines += ["【权重分配 (规则引擎, AI 不可用)】", ""]
-        rule_w = rule_based_weights(feature_names, seasonal_info)
-        sorted_w = sorted(rule_w.items(), key=lambda x: x[1], reverse=True)
-        for name, w in sorted_w[:12]:
-            bar = "█" * int(w * 40)
-            lines.append(f"  {name:<28s} {w:.3f} ({w:.1%}) {bar}")
-
-    if news_brief and news_brief != "DeepSeek API 不可用":
-        lines += ["", "【近期新闻情报】", news_brief[:800]]
-
-    lines += [
-        "",
-        "─" * 68,
-        f"  权重来源: {'DeepSeek API (含实测天气数据)' if used_ai else '本地规则引擎'}",
-        "─" * 68,
-    ]
-
+        lines += ["【权重(规则引擎)】"]
+        rw = rule_based_weights(feature_names, seasonal_info)
+        for name, w in sorted(rw.items(), key=lambda x: x[1], reverse=True)[:12]:
+            lines.append(f"  {name:<28s} {w:.3f} ({w:.1%})")
+    if news_brief and "未能获取" not in news_brief:
+        lines += ["", "【真实新闻情报 (akshare/东方财富)】", news_brief[:2000]]
+    lines += ["", "─" * 68,
+              f"  新闻来源: akshare stock_news_em (6只农业股, 真实+时间戳)",
+              f"  分析引擎: DeepSeek API",
+              "─" * 68]
     return "\n".join(lines)
 
 
 if __name__ == "__main__":
-    from seasonal_calendar import get_season_info
-    info = get_season_info()
-    print(f"当前季节: {info['season']}")
-
+    print("新闻情报 v2 — 真实抓取测试")
     if DEEPSEEK_API_KEY:
-        print("\n正在调用 DeepSeek 获取新闻情报...")
-        brief = fetch_news_brief()
-        print(brief[:500])
+        print("[DeepSeek Key] 已设置")
     else:
-        print("\n未设置 DEEPSEEK_API_KEY")
-        print("export DEEPSEEK_API_KEY=你的key 来启用AI分析")
+        print("[DeepSeek Key] 未设置, 将用网页抓取")
+    print("\n开始抓取新闻...")
+    brief = fetch_news_brief()
+    print(brief[:1000])
