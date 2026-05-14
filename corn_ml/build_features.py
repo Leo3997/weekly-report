@@ -2,6 +2,7 @@
 """特征工程v5：精简特征 + 生长阶段交互 + 三分类标签 + 回归目标"""
 
 import os
+import sys
 
 import numpy as np
 import pandas as pd
@@ -9,7 +10,7 @@ import pandas as pd
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 
 ANOMALY_WINDOW_YEARS = 5
-FORECAST_HORIZONS = [5, 10, 20]
+FORECAST_HORIZONS = [5, 10, 20, 30, 60]
 NOISE_THRESHOLD = 0.015
 
 CLIMATE_STATIONS = [
@@ -69,8 +70,89 @@ def load_and_align() -> pd.DataFrame:
         ), on="date", how="left",
     )
 
+    _load_inventory(merged)
+    _load_usda_wasde(merged)
+    _load_casde(merged)
+
     merged = merged.sort_values("date").reset_index(drop=True)
     return merged
+
+
+def _load_inventory(merged: pd.DataFrame):
+    inv_path = os.path.join(DATA_DIR, "corn_inventory_daily.csv")
+    if os.path.exists(inv_path):
+        inv = pd.read_csv(inv_path, parse_dates=["date"])
+    else:
+        try:
+            import akshare
+            df = akshare.futures_inventory_em(symbol="玉米")
+            df = df.rename(columns={"日期": "date", "库存": "inventory", "增减": "inv_change"})
+            df["date"] = pd.to_datetime(df["date"])
+            inv = df[["date", "inventory", "inv_change"]].copy()
+            inv.to_csv(inv_path, index=False, encoding="utf-8-sig")
+        except Exception:
+            merged["inventory"] = np.nan
+            merged["inv_change"] = np.nan
+            return
+
+    inv = inv.sort_values("date")
+    inv["date"] = pd.to_datetime(inv["date"])
+    inv_dates = inv["date"].values
+    merged_dates = merged["date"].values
+    for col in ["inventory", "inv_change"]:
+        if col not in inv.columns:
+            continue
+        vals = inv[col].values.astype(float)
+        idx = np.searchsorted(inv_dates, merged_dates, side="right") - 1
+        idx = np.clip(idx, 0, len(inv_dates) - 1)
+        merged[col] = vals[idx]
+
+
+def _load_usda_wasde(merged: pd.DataFrame):
+    path = os.path.join(DATA_DIR, "usda_wasde_corn.csv")
+    if not os.path.exists(path):
+        return
+    usda = pd.read_csv(path)
+    usda["report_date"] = pd.to_datetime(usda["report_date"])
+    usda = usda.sort_values("report_date")
+
+    usda_cols = [
+        "global_stocks_to_use", "china_production_mmt", "china_imports_mmt",
+        "china_ending_stocks_mmt", "us_farm_price_usd_bu",
+    ]
+    usda_dates = usda["report_date"].values
+    merged_dates = merged["date"].values
+    for col in usda_cols:
+        if col not in usda.columns:
+            continue
+        vals = usda[col].values.astype(float)
+        idx = np.searchsorted(usda_dates, merged_dates, side="right") - 1
+        idx = np.clip(idx, 0, len(usda_dates) - 1)
+        merged[f"usda_{col}"] = vals[idx]
+
+
+def _load_casde(merged: pd.DataFrame):
+    path = os.path.join(DATA_DIR, "casde_corn_supply_demand.csv")
+    if not os.path.exists(path):
+        return
+    casde = pd.read_csv(path)
+    casde["report_date"] = pd.to_datetime(casde["report_date"])
+    casde = casde.sort_values("report_date")
+
+    casde_cols = [
+        "corn_area_kha", "corn_yield_kg_ha", "corn_feed_consumption_mmt",
+        "corn_industrial_consumption_mmt", "corn_total_consumption_mmt",
+        "corn_imports_mmt", "corn_production_mmt",
+    ]
+    casde_dates = casde["report_date"].values
+    merged_dates = merged["date"].values
+    for col in casde_cols:
+        if col not in casde.columns:
+            continue
+        vals = casde[col].values.astype(float)
+        idx = np.searchsorted(casde_dates, merged_dates, side="right") - 1
+        idx = np.clip(idx, 0, len(casde_dates) - 1)
+        merged[f"casde_{col}"] = vals[idx]
 
 
 def _station_anomaly(df: pd.DataFrame, col_name: str) -> pd.Series:
@@ -223,6 +305,36 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
     df.drop(columns=["t_anom_avg", "p_anom_avg"], inplace=True)
 
+    # ==================== 期货库存特征 (3个) ★ ====================
+    if "inventory" in df.columns:
+        df["inv_level"] = df["inventory"] / 10000
+        df["inv_change_5d"] = df["inv_change"].rolling(5).mean()
+        df["inv_level_vs_ma20"] = df["inventory"] / df["inventory"].rolling(20).mean() - 1
+        for c in ["inventory", "inv_change"]:
+            df.drop(columns=[c], inplace=True, errors="ignore")
+
+    # ==================== USDA WASDE 供需特征 (4个) ★ ====================
+    if "usda_global_stocks_to_use" in df.columns:
+        df["usda_stocks_use"] = df["usda_global_stocks_to_use"]
+        df["usda_stocks_use_yoy"] = df["usda_global_stocks_to_use"].pct_change(252)
+        df["usda_china_imports"] = df["usda_china_imports_mmt"]
+        df["usda_price"] = df["usda_us_farm_price_usd_bu"]
+        raw_usda_cols = ["usda_global_stocks_to_use", "usda_china_production_mmt",
+                         "usda_china_imports_mmt", "usda_china_ending_stocks_mmt",
+                         "usda_us_farm_price_usd_bu"]
+        for c in raw_usda_cols:
+            df.drop(columns=[c], inplace=True, errors="ignore")
+
+    # ==================== CASDE 供需特征 (5个) ★ ====================
+    if "casde_corn_yield_kg_ha" in df.columns:
+        df["casde_yield"] = df["casde_corn_yield_kg_ha"] / 1000
+        df["casde_area"] = df["casde_corn_area_kha"] / 1000
+        df["casde_feed_ratio"] = df["casde_corn_feed_consumption_mmt"] / df["casde_corn_total_consumption_mmt"]
+        df["casde_imports"] = df["casde_corn_imports_mmt"]
+        df["casde_surplus"] = df["casde_corn_total_consumption_mmt"] - df.get("casde_corn_production_mmt", 0)
+        for c in [c for c in df.columns if c.startswith("casde_") and c not in ["casde_yield", "casde_area", "casde_feed_ratio", "casde_imports", "casde_surplus"]]:
+            df.drop(columns=[c], inplace=True, errors="ignore")
+
     # ==================== 多目标标签 ====================
     for horizon in FORECAST_HORIZONS:
         df[f"future_return_{horizon}d"] = df["close"].shift(-horizon) / df["close"] - 1
@@ -277,6 +389,18 @@ FEATURE_COLS = [
     "precip_x_oi",
     "vol_x_basis",
     "mom_x_oi",
+    "inv_level",
+    "inv_change_5d",
+    "inv_level_vs_ma20",
+    "usda_stocks_use",
+    "usda_stocks_use_yoy",
+    "usda_china_imports",
+    "usda_price",
+    "casde_yield",
+    "casde_area",
+    "casde_feed_ratio",
+    "casde_imports",
+    "casde_surplus",
 ]
 
 CORE_FEATURES = [
@@ -299,6 +423,11 @@ PARTIAL_FEATURES = [
     "t_critical", "t_planting", "p_critical", "p_planting",
     "sm_planting_ne", "sm_planting_hb",
     "precip_x_oi", "vol_x_basis", "mom_x_oi",
+    "inv_level", "inv_change_5d", "inv_level_vs_ma20",
+    "usda_china_imports", "usda_price",
+    "casde_imports", "casde_surplus",
+    "usda_stocks_use", "usda_stocks_use_yoy",
+    "casde_yield", "casde_area", "casde_feed_ratio",
 ]
 
 
@@ -334,6 +463,10 @@ def main() -> None:
     print("=" * 60)
     print("  特征工程 v5：精简 + 交互 + 三分类")
     print("=" * 60)
+
+    if not any(a == "--skip-update" for a in sys.argv):
+        from update_data import update_all
+        update_all()
 
     df = load_and_align()
     print(f"数据对齐: {len(df)} 行 ({df['date'].iloc[0].date()} ~ {df['date'].iloc[-1].date()})")

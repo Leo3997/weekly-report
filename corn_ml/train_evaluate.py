@@ -3,6 +3,7 @@
 
 import json
 import os
+import sys
 import warnings
 from datetime import datetime
 
@@ -12,8 +13,8 @@ import pandas as pd
 warnings.filterwarnings("ignore")
 
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
-FORECAST_HORIZONS = [5, 10, 20]
-N_HYPER_SEARCH = 50
+FORECAST_HORIZONS = [5, 10, 20, 30, 60]
+N_HYPER_SEARCH = 20
 
 SAMPLE_WEIGHT_RANGE = (0.4, 2.5)
 SAMPLE_WEIGHT_STEEPNESS = 3.0
@@ -75,6 +76,24 @@ def compute_ai_sample_weight(X, feature_names, ai_weights,
     return sample_weights, ref_median, ref_mad
 
 
+def find_optimal_threshold(y_true, y_prob):
+    from sklearn.metrics import balanced_accuracy_score
+    p_lo = max(0.30, np.percentile(y_prob, 5))
+    p_hi = min(0.70, np.percentile(y_prob, 95))
+    if p_hi - p_lo < 0.05:
+        p_lo = max(0.40, np.median(y_prob) - 0.05)
+        p_hi = min(0.60, np.median(y_prob) + 0.05)
+    thresholds = np.linspace(p_lo, p_hi, 81)
+    best_thresh = 0.5
+    best_score = -1.0
+    for t in thresholds:
+        score = balanced_accuracy_score(y_true, (y_prob >= t).astype(int))
+        if score > best_score:
+            best_score = score
+            best_thresh = t
+    return best_thresh
+
+
 def random_hyper_search(X_train, y_train, X_val, y_val, n_iter=50, sample_weight_tr=None):
     from lightgbm import LGBMClassifier, early_stopping, log_evaluation
     from sklearn.metrics import roc_auc_score
@@ -94,6 +113,7 @@ def random_hyper_search(X_train, y_train, X_val, y_val, n_iter=50, sample_weight
             "colsample_bytree": np.random.choice([0.5, 0.6, 0.7, 0.8]),
             "reg_alpha": np.random.choice([0.0, 0.1, 0.3, 0.5]),
             "reg_lambda": np.random.choice([0.0, 0.5, 1.0, 2.0]),
+            "is_unbalance": True,
             "random_state": 42,
             "verbose": -1,
         }
@@ -108,7 +128,7 @@ def random_hyper_search(X_train, y_train, X_val, y_val, n_iter=50, sample_weight
             if auc > best_score:
                 best_score = auc
                 best_params = {k: v for k, v in params.items()
-                               if k not in ["random_state", "verbose"]}
+                               if k not in ["random_state", "verbose", "is_unbalance"]}
         except Exception:
             continue
 
@@ -133,6 +153,7 @@ def train_lightgbm(X_train, y_train, X_val, y_val, params=None, sample_weight_tr
                   "num_leaves": 16, "min_child_samples": 50, "subsample": 0.8,
                   "colsample_bytree": 0.7, "reg_alpha": 0.1, "reg_lambda": 1.0}
 
+    params["is_unbalance"] = True
     model = LGBMClassifier(**params, random_state=42, verbose=-1)
     model.fit(X_train, y_train, eval_set=[(X_val, y_val)], eval_metric="auc",
               sample_weight=sample_weight_tr,
@@ -154,6 +175,11 @@ def calibrate_predict(model, X_val, y_val, X_te, sample_weight_val=None):
     raw_val_c = np.clip(raw_val, 1e-6, 1 - 1e-6)
     raw_te_c = np.clip(raw_te, 1e-6, 1 - 1e-6)
 
+    raw_spread = raw_te.std()
+    if raw_spread < 0.03:
+        print(f"  跳过校准 (原始概率过于集中, std={raw_spread:.4f})")
+        return raw_te
+
     def _brier_t(T):
         p = expit(logit(raw_val_c) / T)
         return brier_score_loss(y_val, p)
@@ -164,38 +190,32 @@ def calibrate_predict(model, X_val, y_val, X_te, sample_weight_val=None):
     except Exception:
         T_opt = 1.0
 
-    if 0.8 < T_opt < 1.2:
-        cal_te = raw_te
-    else:
-        cal_te = expit(logit(raw_te_c) / T_opt)
-        cal_te = np.clip(cal_te, 0.001, 0.999)
+    cal_te = expit(logit(raw_te_c) / T_opt)
+    cal_te = np.clip(cal_te, 0.001, 0.999)
 
     cal_spread = cal_te.std()
-    raw_spread = raw_te.std()
-    if raw_spread > 1e-6 and cal_spread / raw_spread < 0.3:
-        cal_te = raw_te
-        T_opt = 1.0
+    if cal_spread / max(raw_spread, 1e-6) < 0.3 or cal_spread < 0.02:
+        print(f"  跳过校准 (校准后分布过窄, T={T_opt:.2f} cal_std={cal_spread:.4f} raw_std={raw_spread:.4f})")
+        return raw_te
 
-    if T_opt != 1.0:
-        direction = "锐化" if T_opt < 1.0 else "平滑"
-        print(f"  温度缩放: T={T_opt:.2f}({direction}) raw_std={raw_spread:.3f} -> cal_std={cal_te.std():.3f}")
-    else:
-        print(f"  跳过校准 (原始概率已良好, std={raw_spread:.3f})")
+    direction = "锐化" if T_opt < 1.0 else "平滑"
+    print(f"  温度缩放: T={T_opt:.2f}({direction}) raw_std={raw_spread:.3f} -> cal_std={cal_te.std():.3f}")
 
     return cal_te
 
 
-def evaluate(model, X, y, proba=None) -> dict:
+def evaluate(model, X, y, proba=None, threshold=0.5) -> dict:
     from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
     if proba is None:
         proba = model.predict_proba(X)[:, 1]
-    pred = model.predict(X)
+    pred = (proba >= threshold).astype(int)
     return {
         "n": len(y), "acc": accuracy_score(y, pred),
         "prec": precision_score(y, pred, zero_division=0),
         "rec": recall_score(y, pred, zero_division=0),
         "f1": f1_score(y, pred, zero_division=0),
         "auc": roc_auc_score(y, proba), "up": y.mean(),
+        "thresh": threshold, "pred_up": pred.mean(),
     }
 
 
@@ -222,7 +242,7 @@ def rolling_backtest(X_all, y_all, dates, train_months=60,
             sw_tr, _, _ = compute_ai_sample_weight(X_tr, feature_names, ai_weights)
 
         m = LGBMClassifier(n_estimators=200, learning_rate=0.05, max_depth=4,
-                           num_leaves=15, random_state=42, verbose=-1)
+                           num_leaves=15, is_unbalance=True, random_state=42, verbose=-1)
         m.fit(X_tr, y_tr, sample_weight=sw_tr)
         from sklearn.metrics import accuracy_score
         results.append({"month": f"{tm[0]}-{tm[1]:02d}", "n": len(y_te),
@@ -268,8 +288,8 @@ def plot_prediction_curves(all_dates, all_probas, all_actuals, all_returns, save
     except Exception:
         pass
 
-    colors = ["#2196F3", "#FF9800", "#E91E63"]
-    color_light = ["#BBDEFB", "#FFE0B2", "#F8BBD0"]
+    colors = ["#2196F3", "#FF9800", "#E91E63", "#4CAF50", "#9C27B0"]
+    color_light = ["#BBDEFB", "#FFE0B2", "#F8BBD0", "#C8E6C9", "#E1BEE7"]
 
     fig = plt.figure(figsize=(16, 10))
     gs = fig.add_gridspec(3, 3, hspace=0.45, wspace=0.35,
@@ -291,7 +311,7 @@ def plot_prediction_curves(all_dates, all_probas, all_actuals, all_returns, save
     ax_ts.axhline(y=0.5, color="gray", linestyle="--", linewidth=0.8, alpha=0.6)
     ax_ts.set_ylabel("上涨概率", fontsize=11)
     ax_ts.set_title("多周期预测概率时序（测试集）", fontsize=13, fontweight="bold")
-    ax_ts.legend(loc="upper left", fontsize=9, ncol=3)
+    ax_ts.legend(loc="upper left", fontsize=9, ncol=5)
     ax_ts.set_ylim(0, 1)
     ax_ts.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
     ax_ts.tick_params(axis="both", labelsize=9)
@@ -393,7 +413,7 @@ def plot_forward_forecast(models, latest_date, close_price, X_latest, save_path)
     forecast_dates = [latest_date + pd.Timedelta(days=h) for h in FORECAST_HORIZONS]
     forecast_date_labels = ["今天"] + [d.strftime("%m-%d") for d in forecast_dates]
 
-    colors = ["#2196F3", "#FF9800", "#E91E63"]
+    colors = ["#2196F3", "#FF9800", "#E91E63", "#4CAF50", "#9C27B0"]
     directions = ["▲ 看涨" if probas[h] > 0.5 else "▼ 看跌" for h in FORECAST_HORIZONS]
 
     fig = plt.figure(figsize=(14, 8))
@@ -402,7 +422,7 @@ def plot_forward_forecast(models, latest_date, close_price, X_latest, save_path)
 
     # =================== 图A: 前向预测曲线 ===================
     ax_main = fig.add_subplot(gs[0, :])
-    x_pos = [0, 5, 10, 20]
+    x_pos = [0, 5, 10, 20, 30, 60]
     probs_list = [0.5] + [probas[h] for h in FORECAST_HORIZONS]
     dir_list = [""] + directions
 
@@ -525,7 +545,7 @@ def train_and_predict_daily(df, feature_cols, core_features, partial_features,
         "n_estimators": 300, "learning_rate": 0.03, "max_depth": 4,
         "num_leaves": 16, "min_child_samples": 50, "subsample": 0.8,
         "colsample_bytree": 0.7, "reg_alpha": 0.1, "reg_lambda": 1.0,
-        "random_state": 42, "verbose": -1,
+        "is_unbalance": True, "random_state": 42, "verbose": -1,
     }
 
     daily_probas = {}
@@ -694,7 +714,7 @@ def plot_daily_forecast_curves(daily_probas, latest_date, close_price, save_path
     print(f"  {'='*60}")
 
 
-def save_predictions_csv(all_dates, all_probas, all_actuals, all_returns, save_path):
+def save_predictions_csv(all_dates, all_probas, all_actuals, all_returns, thresholds, save_path):
     n_max = max(len(all_dates[h]) for h in FORECAST_HORIZONS)
     rows = []
     for i in range(n_max):
@@ -705,11 +725,12 @@ def save_predictions_csv(all_dates, all_probas, all_actuals, all_returns, save_p
                 row["date"] = pd.Timestamp(d[i]).strftime("%Y-%m-%d")
                 break
         for h in FORECAST_HORIZONS:
+            thresh = thresholds.get(h, 0.5)
             if i < len(all_probas[h]):
                 row[f"prob_T+{h}d"] = round(float(all_probas[h][i]), 6)
                 row[f"label_T+{h}d"] = int(all_actuals[h][i])
                 row[f"return_T+{h}d"] = round(float(all_returns[h][i]), 6)
-                pred_dir = 1 if all_probas[h][i] > 0.5 else 0
+                pred_dir = 1 if all_probas[h][i] >= thresh else 0
                 row[f"pred_T+{h}d"] = pred_dir
             else:
                 row[f"prob_T+{h}d"] = np.nan
@@ -724,6 +745,19 @@ def save_predictions_csv(all_dates, all_probas, all_actuals, all_returns, save_p
 
 def main():
     from build_features import FEATURE_COLS, CORE_FEATURES, PARTIAL_FEATURES, NOISE_THRESHOLD
+
+    fast_mode = any(a == "--fast" for a in sys.argv)
+    if fast_mode:
+        print("  [快速模式] 跳过滚动回测 + 逐日模型")
+
+    if not any(a == "--skip-update" for a in sys.argv):
+        from update_data import update_all
+        update_all()
+        local_build_path = os.path.join(DATA_DIR, "build_features.py")
+        if os.path.exists(local_build_path):
+            print("\n  [自动重建特征] 数据已更新，重新计算特征...")
+            import subprocess
+            subprocess.run([sys.executable, local_build_path, "--skip-update"], check=False)
 
     df = pd.read_csv(os.path.join(DATA_DIR, "features_full_v2.csv"), parse_dates=["date"])
 
@@ -746,6 +780,7 @@ def main():
     all_test_dates = {}
     all_test_actuals = {}
     all_test_returns = {}
+    all_thresholds = {}
     models = {}
 
     CORE_FEATURES_REF = CORE_FEATURES
@@ -782,7 +817,14 @@ def main():
         models[horizon] = model
         print(f"  最佳迭代: {model.best_iteration_}")
 
+        val_proba_raw = model.predict_proba(X_val)[:, 1]
+        test_proba_raw = model.predict_proba(X_test)[:, 1]
+
         proba_cal = calibrate_predict(model, X_val, y_val, X_test, sw_val)
+
+        opt_thresh = find_optimal_threshold(y_val, val_proba_raw)
+        all_thresholds[horizon] = opt_thresh
+        print(f"  最优阈值: {opt_thresh:.3f} (验证集均衡准确率最优)")
 
         t_dates, t_actuals, t_returns = extract_test_dates_and_actuals(df, horizon, CORE_FEATURES_REF)
         all_test_dates[horizon] = t_dates
@@ -791,13 +833,14 @@ def main():
         all_test_actuals[horizon] = t_actuals[:min_len]
         all_test_returns[horizon] = t_returns[:min_len]
 
-        print(f"\n  {'集合':<6s} {'样本':>6s} {'准确率':>7s} {'精确率':>7s} {'召回率':>7s} {'F1':>7s} {'AUC':>7s}")
-        print(f"  {'─'*52}")
-        for X, y, name in [(X_train, y_train, "训练"), (X_val, y_val, "验证"), (X_test, y_test, "测试")]:
-            m = evaluate(model, X, y)
-            print(f"  {name:<6s} {m['n']:>6d} {m['acc']:>6.2%} {m['prec']:>6.2%} {m['rec']:>6.2%} {m['f1']:>7.4f} {m['auc']:>7.4f}")
-            if name == "测试":
-                summary_rows.append({"Horizon": f"T+{horizon}d", **{k: m[k] for k in ["n", "acc", "auc", "prec", "rec", "f1"]}})
+        print(f"\n  {'集合':<6s} {'样本':>6s} {'阈值':>6s} {'准确率':>7s} {'精确率':>7s} {'召回率':>7s} {'F1':>7s} {'AUC':>7s} {'预测涨%':>8s}")
+        print(f"  {'─'*66}")
+        for X, y, name in [(X_train, y_train, "训练"), (X_val, y_val, "验证")]:
+            m = evaluate(model, X, y, threshold=opt_thresh)
+            print(f"  {name:<6s} {m['n']:>6d} {m['thresh']:>5.2f} {m['acc']:>6.2%} {m['prec']:>6.2%} {m['rec']:>6.2%} {m['f1']:>7.4f} {m['auc']:>7.4f} {m['pred_up']:>7.1%}")
+        m = evaluate(model, X_test, y_test, proba=proba_cal[:min_len], threshold=opt_thresh)
+        print(f"  {'测试':<6s} {m['n']:>6d} {m['thresh']:>5.2f} {m['acc']:>6.2%} {m['prec']:>6.2%} {m['rec']:>6.2%} {m['f1']:>7.4f} {m['auc']:>7.4f} {m['pred_up']:>7.1%}")
+        summary_rows.append({"Horizon": f"T+{horizon}d", "thresh": opt_thresh, **{k: m[k] for k in ["n", "acc", "auc", "prec", "rec", "f1"]}})
 
         imp = model.feature_importances_
         imp = imp / imp.sum()
@@ -824,40 +867,42 @@ def main():
         confident_mask = ~uncertain
         if confident_mask.sum() > 5:
             from sklearn.metrics import accuracy_score
-            conf_acc = accuracy_score(y_test[confident_mask], (proba_cal[confident_mask] > 0.5).astype(int))
+            conf_acc = accuracy_score(y_test[confident_mask], (proba_cal[confident_mask] >= opt_thresh).astype(int))
             print(f"  置信区间: {uncertain.sum()}/{len(y_test)} = {uncertain.mean():.0%} 不确定 -> 剔除后准确率 {conf_acc:.1%}")
 
-        print(f"\n  [滚动回测...]")
-        label_col = f"label_binary_{horizon}d"
-        mask = df[label_col].notna() & (df[label_col] != -1)
-        for col in CORE_FEATURES_REF:
-            mask &= df[col].notna()
-        clean = df[mask].copy()
-        for col in PARTIAL_FEATURES:
-            clean[col] = clean[col].fillna(0.0)
-        X_all = clean[FEATURE_COLS].values.astype(np.float64)
-        y_all = clean[label_col].values.astype(np.int64)
-        bt = rolling_backtest(X_all, y_all, clean["date"],
-                              feature_names=FEATURE_COLS if use_ai else None,
-                              ai_weights=ai_weights if use_ai else None)
-        if not bt.empty:
-            r12 = bt.tail(12)
-            print(f"  {len(bt)}个月 | 均值={bt['acc'].mean():.2%} ±{bt['acc'].std():.3f} | 近12月={r12['acc'].mean():.2%}")
+        if not fast_mode:
+            print(f"\n  [滚动回测...]")
+            label_col = f"label_binary_{horizon}d"
+            mask = df[label_col].notna() & (df[label_col] != -1)
+            for col in CORE_FEATURES_REF:
+                mask &= df[col].notna()
+            clean = df[mask].copy()
+            for col in PARTIAL_FEATURES:
+                clean[col] = clean[col].fillna(0.0)
+            X_all = clean[FEATURE_COLS].values.astype(np.float64)
+            y_all = clean[label_col].values.astype(np.int64)
+            bt = rolling_backtest(X_all, y_all, clean["date"],
+                                  feature_names=FEATURE_COLS if use_ai else None,
+                                  ai_weights=ai_weights if use_ai else None)
+            if not bt.empty:
+                r12 = bt.tail(12)
+                print(f"  {len(bt)}个月 | 均值={bt['acc'].mean():.2%} ±{bt['acc'].std():.3f} | 近12月={r12['acc'].mean():.2%}")
 
     print(f"\n{'='*66}")
     print(f"  多目标汇总 (AI权重 + 校准)")
     print(f"{'='*66}")
-    print(f"  {'目标':<10s} {'样本':>6s} {'准确率':>7s} {'AUC':>7s} {'精确率':>7s} {'召回率':>7s} {'F1':>7s}")
-    print(f"  {'─'*52}")
+    print(f"  {'目标':<10s} {'阈值':>6s} {'样本':>6s} {'准确率':>7s} {'AUC':>7s} {'精确率':>7s} {'召回率':>7s} {'F1':>7s}")
+    print(f"  {'─'*60}")
     for s in summary_rows:
-        print(f"  {s['Horizon']:<10s} {s['n']:>6d} {s['acc']:>6.2%} {s['auc']:>7.4f} {s['prec']:>6.2%} {s['rec']:>6.2%} {s['f1']:>7.4f}")
+        print(f"  {s['Horizon']:<10s} {s['thresh']:>5.2f} {s['n']:>6d} {s['acc']:>6.2%} {s['auc']:>7.4f} {s['prec']:>6.2%} {s['rec']:>6.2%} {s['f1']:>7.4f}")
 
     latest_summary = []
     for h in FORECAST_HORIZONS:
+        thresh = all_thresholds.get(h, 0.5)
         if h in all_test_probas and len(all_test_probas[h]) > 0:
             latest_summary.append(
                 f"T+{h}d={all_test_probas[h][-1]:.1%}"
-                f"({'▲看涨' if all_test_probas[h][-1] > 0.5 else '▼看跌'})")
+                f"({'▲看涨' if all_test_probas[h][-1] >= thresh else '▼看跌'})")
     if latest_summary:
         print(f"\n  最新预测: {' | '.join(latest_summary)}")
 
@@ -868,7 +913,7 @@ def main():
 
     csv_path = os.path.join(DATA_DIR, "predictions_detail.csv")
     save_predictions_csv(all_test_dates, all_test_probas,
-                         all_test_actuals, all_test_returns, csv_path)
+                         all_test_actuals, all_test_returns, all_thresholds, csv_path)
 
     print(f"\n  [生成前向预测...]")
     X_latest, latest_date, close_price = get_latest_features(
@@ -877,13 +922,14 @@ def main():
     forward_path = os.path.join(DATA_DIR, "forward_forecast.png")
     plot_forward_forecast(models, latest_date, close_price, X_latest, forward_path)
 
-    print(f"\n  [生成逐日预测折线（1~20天）...]")
-    print(f"  正在训练 {len(DAILY_HORIZONS)} 个逐日模型...")
-    daily_probas, _ = train_and_predict_daily(
-        df, FEATURE_COLS, CORE_FEATURES_REF, PARTIAL_FEATURES,
-        ai_weights, X_latest)
-    daily_path = os.path.join(DATA_DIR, "daily_forecast.png")
-    plot_daily_forecast_curves(daily_probas, latest_date, close_price, daily_path)
+    if not fast_mode:
+        print(f"\n  [生成逐日预测折线（1~20天）...]")
+        print(f"  正在训练 {len(DAILY_HORIZONS)} 个逐日模型...")
+        daily_probas, _ = train_and_predict_daily(
+            df, FEATURE_COLS, CORE_FEATURES_REF, PARTIAL_FEATURES,
+            ai_weights, X_latest)
+        daily_path = os.path.join(DATA_DIR, "daily_forecast.png")
+        plot_daily_forecast_curves(daily_probas, latest_date, close_price, daily_path)
 
     print(f"\n  完成 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*66}")

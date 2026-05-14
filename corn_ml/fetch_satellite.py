@@ -29,7 +29,7 @@ NASA_PARAMS = (
 
 PARAM_NAMES = ["GWETROOT", "GWETTOP", "GWETPROF", "ALLSKY_SFC_SW_DWN", "RH2M"]
 
-YEARS = list(range(2010, 2026))
+YEARS = list(range(2010, 2027))
 
 
 def _fetch(lat: float, lon: float, start: int, end: int) -> dict:

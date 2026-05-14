@@ -12,7 +12,7 @@ from sklearn.metrics import brier_score_loss, roc_auc_score, accuracy_score
 warnings.filterwarnings("ignore")
 
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
-HORIZONS = [5, 10, 20]
+HORIZONS = [5, 10, 20, 30, 60]
 
 from build_features import FEATURE_COLS
 

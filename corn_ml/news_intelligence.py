@@ -68,7 +68,22 @@ CORN_KEYWORDS = [
     "玉米", "粮食", "谷物", "饲料", "种植", "大豆", "豆粕",
     "小麦", "收储", "CBOT", "cbot", "养殖", "生猪", "农产品",
     "中储粮", "进口", "出口", "关税", "补贴", "种业", "育种",
-    "转基因", "天气", "干旱", "洪涝", "产量", "库存",
+    "转基因", "天气", "干旱", "洪涝", "产量",
+]
+
+AGRI_SPECIFIC_KW = [
+    "玉米", "粮食", "谷物", "饲料", "种植", "大豆", "豆粕",
+    "小麦", "收储", "CBOT", "cbot", "养殖", "生猪", "农产品",
+    "中储粮", "种业", "育种", "转基因", "干旱", "洪涝", "产量",
+]
+
+EXCLUDE_KW = [
+    "铜", "铝", "锌", "锡", "镍", "原油", "石油", "黄金", "白银",
+    "锂", "钴", "铁矿石", "螺纹钢", "甲醇", "PTA", "LPG", "碳酸锂",
+    "芯片", "半导体", "新能源车", "光伏", "医药", "地产", "楼市",
+    "人民币汇率", "央行", "MLF", "LPR", "降息", "降准", "A股",
+    "上证", "深证", "创业板", "沙特", "中东冲突", "俄乌",
+    "制造业", "工业", "轮胎", "锡价", "锡矿",
 ]
 
 
@@ -112,8 +127,10 @@ def _call_deepseek(prompt: str, max_tokens: int = 2000) -> str:
 
 # ============= 新闻抓取 (akshare stock_news_em, 真实+时间戳) =============
 
-def _fetch_agri_news_akshare(max_per_stock: int = 10) -> list[dict]:
-    """通过 akshare 的 stock_news_em 抓取农业股关联新闻 (真实时间戳)"""
+def _fetch_agri_news_akshare(max_per_stock: int = 20, max_age_days: int = 7) -> list[dict]:
+    from datetime import timedelta
+    cutoff_date = date.today() - timedelta(days=max_age_days)
+
     results: list[dict] = []
     seen = set()
 
@@ -124,15 +141,22 @@ def _fetch_agri_news_akshare(max_per_stock: int = 10) -> list[dict]:
         except Exception as e:
             print(f"  [akshare {name}] {e}", file=sys.stderr)
             continue
+        count = 0
         for _, row in df.iterrows():
             title = str(row.get("新闻标题", ""))
             if not any(kw in title for kw in CORN_KEYWORDS):
+                continue
+            pub_time = str(row.get("发布时间", ""))
+            try:
+                dt = datetime.strptime(pub_time[:10], "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if dt < cutoff_date:
                 continue
             key = title[:60]
             if key in seen:
                 continue
             seen.add(key)
-            pub_time = str(row.get("发布时间", ""))
             summary = str(row.get("新闻内容", ""))[:200]
             source = str(row.get("文章来源", name))
             url = str(row.get("新闻链接", ""))
@@ -141,88 +165,163 @@ def _fetch_agri_news_akshare(max_per_stock: int = 10) -> list[dict]:
                 "time": pub_time, "source": f"{name}({source})",
                 "url": url,
             })
-        if len(results) >= max_per_stock * len(AGRI_STOCKS):
-            break
+            count += 1
+            if count >= max_per_stock:
+                break
 
     results.sort(key=lambda x: x.get("time", ""), reverse=True)
     return results
 
 
-def _fetch_sina_corn_search(max_items: int = 15, max_age_days: int = 7) -> list[dict]:
-    """从新浪财经期货滚动新闻抓取农业相关 (自带时间戳, 辅助源)"""
+def _fetch_sina_corn_search(max_items: int = 40, max_age_days: int = 7) -> list[dict]:
     now_ts = int(datetime.now().timestamp())
     cutoff = now_ts - max_age_days * 86400
     results = []
-    try:
-        r = requests.get(
-            "https://feed.mix.sina.com.cn/api/roll/get",
-            params={"pageid": 153, "lid": 2516, "num": 50, "page": 1},
-            headers=HEADERS, timeout=15,
-        )
-        if r.status_code != 200:
-            return results
-        data = r.json()
-        for item in data.get("result", {}).get("data", []):
-            title = item.get("title", "")
-            intro = item.get("intro", "")
-            if not any(kw in title + intro for kw in CORN_KEYWORDS):
+    seen = set()
+    for page in range(1, 4):
+        try:
+            r = requests.get(
+                "https://feed.mix.sina.com.cn/api/roll/get",
+                params={"pageid": 153, "lid": 2516, "num": 50, "page": page},
+                headers=HEADERS, timeout=15,
+            )
+            if r.status_code != 200:
                 continue
-            ctime = int(item.get("ctime", 0))
-            if ctime < cutoff:
+            data = r.json()
+            for item in data.get("result", {}).get("data", []):
+                title = item.get("title", "")
+                intro = item.get("intro", "")
+                combined = title + (intro or "")
+                if not any(kw in combined for kw in AGRI_SPECIFIC_KW):
+                    continue
+                if any(kw in combined for kw in EXCLUDE_KW):
+                    continue
+                ctime = int(item.get("ctime", 0))
+                if ctime < cutoff:
+                    continue
+                key = (title + (intro or "")[:40])
+                if key in seen:
+                    continue
+                seen.add(key)
+                dt = datetime.fromtimestamp(ctime)
+                results.append({
+                    "title": title, "abstract": intro[:150] if intro else "",
+                    "time": dt.strftime("%Y-%m-%d %H:%M"), "source": "新浪财经",
+                })
+                if len(results) >= max_items:
+                    break
+            if len(results) >= max_items:
+                break
+        except Exception:
+            pass
+    return results
+
+
+def _fetch_eastmoney_corn_search(max_items: int = 30, max_age_days: int = 7) -> list[dict]:
+    from datetime import timedelta
+    cutoff_date = date.today() - timedelta(days=max_age_days)
+    results = []
+    seen = set()
+    search_keywords = ["玉米期货", "玉米价格", "玉米供需", "玉米进口", "玉米库存",
+                       "玉米种植", "CBOT玉米", "农产品期货", "粮食安全"]
+    for keyword in search_keywords:
+        if len(results) >= max_items:
+            break
+        try:
+            ak = _get_ak()
+            df = ak.stock_news_em(symbol=keyword)
+        except Exception:
+            continue
+        if df is None or df.empty:
+            continue
+        for _, row in df.iterrows():
+            title = str(row.get("新闻标题", ""))
+            if any(kw in title for kw in EXCLUDE_KW):
                 continue
-            dt = datetime.fromtimestamp(ctime)
+            pub_time = str(row.get("发布时间", ""))
+            try:
+                dt = datetime.strptime(pub_time[:10], "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if dt < cutoff_date:
+                continue
+            key = title[:60]
+            if key in seen:
+                continue
+            seen.add(key)
+            summary = str(row.get("新闻内容", ""))[:200]
+            source = str(row.get("文章来源", "东方财富"))
+            url = str(row.get("新闻链接", ""))
             results.append({
-                "title": title, "abstract": intro[:150] if intro else "",
-                "time": dt.strftime("%Y-%m-%d %H:%M"), "source": "新浪财经",
+                "title": title, "abstract": summary,
+                "time": pub_time, "source": source,
+                "url": url,
             })
             if len(results) >= max_items:
                 break
-    except Exception:
-        pass
+
+    results.sort(key=lambda x: x.get("time", ""), reverse=True)
     return results
 
 
 def collect_corn_news(max_age_days: int = 7) -> str:
-    """通过 akshare 农业股票新闻接口搜集玉米相关真实新闻"""
     import time as _time
 
-    print("  [akshare] 抓取农业股关联新闻...", file=sys.stderr)
-    all_items = _fetch_agri_news_akshare(10)
-    
-    # Also add Sina futures feed as supplement
-    try:
-        sina_items = _fetch_sina_corn_search(15, max_age_days)
-        seen_titles = {it["title"][:60] for it in all_items}
-        for item in sina_items:
-            if item["title"][:60] not in seen_titles:
-                seen_titles.add(item["title"][:60])
-                all_items.append(item)
-    except Exception:
-        pass
+    all_items: list[dict] = []
+    seen_titles: set = set()
+
+    print("  [东方财富] 玉米关键词直接搜索...", file=sys.stderr)
+    em_items = _fetch_eastmoney_corn_search(30, max_age_days)
+    for it in em_items:
+        key = it["title"][:60]
+        if key not in seen_titles:
+            seen_titles.add(key)
+            all_items.append(it)
+    print(f"    ✓ 东方财富: {len(em_items)}条", file=sys.stderr)
+
+    print("  [akshare] 农业股关联新闻...", file=sys.stderr)
+    agri_items = _fetch_agri_news_akshare(20, max_age_days)
+    for it in agri_items:
+        key = it["title"][:60]
+        if key not in seen_titles:
+            seen_titles.add(key)
+            all_items.append(it)
+    print(f"    ✓ akshare农业股: {len(agri_items)}条", file=sys.stderr)
+
+    print("  [新浪财经] 期货滚动新闻...", file=sys.stderr)
+    sina_items = _fetch_sina_corn_search(40, max_age_days)
+    for it in sina_items:
+        key = (it["title"] + it.get("abstract", ""))[:60]
+        if key not in seen_titles:
+            seen_titles.add(key)
+            all_items.append(it)
+    print(f"    ✓ 新浪财经: {len(sina_items)}条", file=sys.stderr)
 
     if not all_items:
-        return "[未能获取到新闻 — akshare API 可能暂时不可用]"
+        return "[未能获取到新闻 — 各新闻源可能暂时不可用]"
+
+    all_items.sort(key=lambda x: str(x.get("time", "")), reverse=True)
 
     today = date.today()
     lines = [
-        f"以下为 {today} 从 akshare 农业股票新闻接口抓取的真实玉米相关新闻:",
+        f"以下为 {today} 从多源抓取的真实玉米相关新闻:",
         f"",
-        f"数据来源: 东方财富新闻 (北大荒/丰乐种业/大北农/隆平高科/神农种业/农发种业)",
-        f"时效过滤: 各股最新10条中筛选玉米相关, 每条均有真实发布时间戳",
-        f"共 {len(all_items)} 条, 展示如下:",
+        f"数据来源: 东方财富关键词搜索 + akshare农业股新闻 + 新浪财经期货滚动",
+        f"时效过滤: 仅保留{today}前{max_age_days}天内新闻",
+        f"共 {len(all_items)} 条, 展示如下 (全部来自真实数据接口):",
         "",
     ]
 
-    for i, item in enumerate(all_items[:30], 1):
+    for i, item in enumerate(all_items[:40], 1):
         time_s = f"[{item.get('time','')}] " if item.get('time') else ""
-        src_s = f" ({item.get('source','')})"
+        src_s = f" ({item.get('source','')})" if item.get('source') else ""
         lines.append(f"{i}. {time_s}{item['title'][:120]}{src_s}")
         if item.get("abstract"):
             abst = re.sub(r'<[^>]+>', '', item['abstract'])[:150]
             if abst:
                 lines.append(f"   {abst}")
 
-    lines.append(f"\n(以上为东方财富/akshare 真实数据接口返回, 非 AI 生成)")
+    lines.append(f"\n(以上为多源真实数据接口返回, 共{len(all_items)}条, 非AI生成)")
     return "\n".join(lines)
 
 
@@ -376,6 +475,7 @@ def generate_weight_proposal(
     seasonal_info: dict,
     live_data: str = "",
     news_brief: str = "",
+    supply_demand_summary: str = "",
 ) -> tuple[str, dict[str, float], dict[str, str]]:
     features_str = "\n".join(f"  {i+1}. {n}" for i, n in enumerate(feature_names))
 
@@ -390,7 +490,10 @@ def generate_weight_proposal(
 {live_data[:1000]}
 
 ## 真实新闻 (百度搜索抓取 + DeepSeek分析)
-{news_brief[:1500]}
+{news_brief[:1200]}
+
+## 供需库存数据 (USDA WASDE + CASDE + 期货库存)
+{supply_demand_summary[:1500]}
 
 ## 特征列表 ({len(feature_names)}个)
 {features_str}
@@ -398,6 +501,7 @@ def generate_weight_proposal(
 ## 任务
 给每个特征分配权重(0-1, 总和=1), 并解释原因.
 权重必须引用实测数据或新闻原文中的具体数字.
+特别注意: 供需库存类特征(inv_, usda_, casde_开头)应根据当前库存水平和供需数据调整权重.
 
 JSON格式要求 (输出纯JSON, 键名用特征原名):
 {{"weights": {{"feat1": 0.05, "feat2": 0.08}}, "reasoning": {{"feat1": "理由"}}, "summary": "概述"}}
@@ -446,8 +550,187 @@ def rule_based_weights(feature_names, seasonal_info):
     return {k: v / total for k, v in w.items()}
 
 
+def get_inventory_summary() -> str:
+    """读取期货库存数据并生成可读摘要"""
+    import numpy as np
+    inv_path = os.path.join(DATA_DIR, "corn_inventory_daily.csv")
+    if not os.path.exists(inv_path):
+        try:
+            ak = _get_ak()
+            df = ak.futures_inventory_em(symbol="玉米")
+            df = df.rename(columns={"日期": "date", "库存": "inventory", "增减": "inv_change"})
+            df["date"] = pd.to_datetime(df["date"])
+            df[["date", "inventory", "inv_change"]].to_csv(inv_path, index=False, encoding="utf-8-sig")
+        except Exception:
+            return "【玉米期货库存】数据暂不可用"
+
+    df = pd.read_csv(inv_path, parse_dates=["date"])
+    df = df.sort_values("date")
+    latest = df.iloc[-1]
+    week_ago_idx = max(0, len(df) - 6)
+    week_ago = df.iloc[week_ago_idx]
+    month_ago_idx = max(0, len(df) - 22)
+    month_ago = df.iloc[month_ago_idx]
+
+    inv_now = latest["inventory"]
+    inv_wk = week_ago["inventory"]
+    inv_mo = month_ago["inventory"]
+    chg_now = latest.get("inv_change", np.nan)
+
+    lines = [
+        "=" * 68,
+        "  【玉米期货库存 (大商所注册仓单)】",
+        "=" * 68,
+        f"  数据截止: {latest['date'].strftime('%Y-%m-%d')}",
+        f"  最新库存: {inv_now:.0f} 吨  ({inv_now/10000:.2f} 万吨)",
+        f"  日增减量: {chg_now:+.0f} 吨" if not np.isnan(chg_now) else "",
+        f"  较一周前: {inv_now - inv_wk:+.0f} 吨 ({(inv_now/inv_wk - 1)*100:+.1f}%)",
+        f"  较一月前: {inv_now - inv_mo:+.0f} 吨 ({(inv_now/inv_mo - 1)*100:+.1f}%)",
+        "",
+    ]
+    trend = "↑ 库存累积（供应宽松，利空）" if inv_now > inv_mo * 1.05 else (
+        "↓ 库存下降（供应收紧，利多）" if inv_now < inv_mo * 0.95 else "→ 库存平稳（供需平衡）")
+    lines.append(f"  趋势判断: {trend}")
+
+    recent = df.tail(10)
+    lines.append("  近10日库存变化:")
+    for _, r in recent.iterrows():
+        chg_str = f" ({r['inv_change']:+.0f})" if not pd.isna(r.get("inv_change", np.nan)) else ""
+        lines.append(f"    {r['date'].strftime('%m-%d')}: {r['inventory']:.0f}{chg_str}")
+
+    lines.append("")
+    lines.append("  数据来源: 东方财富 futures_inventory_em(symbol='玉米')")
+    return "\n".join(lines)
+
+
+def get_wasde_summary() -> str:
+    """读取 USDA WASDE 玉米供需数据并生成可读摘要"""
+    path = os.path.join(DATA_DIR, "usda_wasde_corn.csv")
+    if not os.path.exists(path):
+        return "【USDA WASDE 供需报告】数据暂不可用"
+
+    df = pd.read_csv(path)
+    df = df.sort_values("report_date")
+    latest = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) > 1 else latest
+
+    def _diff(label, unit, curr, prev_val, fmt=".1f"):
+        d = curr - prev_val
+        sign = "+" if d > 0 else ""
+        return f"  {label:<20s}: {curr:{fmt}} {unit}  (较上年 {sign}{d:{fmt}})"
+
+    lines = [
+        "=" * 68,
+        f"  【USDA WASDE 玉米供需报告】",
+        f"  报告日期: {latest['report_date']}  |  市场年度: {latest.get('market_year','?')}",
+        "=" * 68,
+        _diff("全球产量", "亿吨", latest["global_production_mmt"] / 100, prev["global_production_mmt"] / 100),
+        _diff("全球消费", "亿吨", latest["global_consumption_mmt"] / 100, prev["global_consumption_mmt"] / 100),
+        _diff("全球期末库存", "亿吨", latest["global_ending_stocks_mmt"] / 100, prev["global_ending_stocks_mmt"] / 100),
+        f"  全球库存消费比: {latest['global_stocks_to_use']:.1f}%  (上年 {prev['global_stocks_to_use']:.1f}%)",
+        "",
+        _diff("中国产量", "亿吨", latest["china_production_mmt"] / 100, prev["china_production_mmt"] / 100),
+        _diff("中国进口", "百万吨", latest["china_imports_mmt"] / 100, prev["china_imports_mmt"] / 100, ".2f"),
+        _diff("中国期末库存", "亿吨", latest["china_ending_stocks_mmt"] / 100, prev["china_ending_stocks_mmt"] / 100),
+        "",
+        _diff("美国产量", "亿吨", latest["us_production_mmt"] / 100, prev["us_production_mmt"] / 100),
+        f"  美国农场均价: ${latest['us_farm_price_usd_bu']:.2f}/蒲  (上年 ${prev['us_farm_price_usd_bu']:.2f})",
+        _diff("巴西产量", "亿吨", latest["brazil_production_mmt"] / 100, prev["brazil_production_mmt"] / 100),
+        _diff("阿根廷产量", "亿吨", latest["argentina_production_mmt"] / 100, prev["argentina_production_mmt"] / 100),
+        "",
+    ]
+
+    stocks_change = latest["global_ending_stocks_mmt"] - prev["global_ending_stocks_mmt"]
+    price_change = latest["us_farm_price_usd_bu"] - prev["us_farm_price_usd_bu"]
+    if stocks_change < -5:
+        bias = "★★★ 利多 — 全球库存显著下降，供应收紧"
+    elif stocks_change < 0:
+        bias = "★★☆ 偏多 — 全球库存小幅下降"
+    elif stocks_change > 5:
+        bias = "☆☆☆ 利空 — 全球库存显著上升"
+    else:
+        bias = "★☆☆ 中性 — 全球库存变化不大"
+    lines.append(f"  综合判断: {bias}")
+
+    if price_change != 0:
+        lines.append(f"  美国农场均价同比: {price_change:+.2f} $/蒲 (预示新季价格方向)")
+    lines.append("  数据来源: USDA FAS PSD + chinagrain.cn 转载")
+    return "\n".join(lines)
+
+
+def get_casde_summary() -> str:
+    """读取 CASDE 中国玉米供需数据并生成可读摘要"""
+    path = os.path.join(DATA_DIR, "casde_corn_supply_demand.csv")
+    if not os.path.exists(path):
+        return "【CASDE 中国供需报告】数据暂不可用"
+
+    df = pd.read_csv(path)
+    df = df.sort_values("report_date")
+    latest = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) > 1 else latest
+
+    def _diff(label, unit, curr, prev_val, fmt=".1f", factor=1):
+        d = curr - prev_val
+        sign = "+" if d > 0 else ""
+        return f"  {label:<18s}: {curr/factor:{fmt}} {unit}  (较上年 {sign}{d/factor:{fmt}})"
+
+    area_cur = latest["corn_area_kha"]
+    area_prev = prev["corn_area_kha"]
+    yield_cur = latest["corn_yield_kg_ha"]
+
+    lines = [
+        "=" * 68,
+        f"  【CASDE 中国玉米供需形势】",
+        f"  报告日期: {latest['report_date']}  |  市场年度: {latest.get('market_year','?')}",
+        "=" * 68,
+        _diff("种植面积", "千公顷", area_cur, area_prev, ".0f"),
+        _diff("产量", "万吨", latest["corn_production_mmt"] * 100, prev["corn_production_mmt"] * 100, ".0f", 1),
+        f"  单产: {yield_cur:.0f} 公斤/公顷 ({yield_cur/15:.1f} 公斤/亩)",
+        "",
+        _diff("饲用消费", "万吨", latest["corn_feed_consumption_mmt"] * 100, prev["corn_feed_consumption_mmt"] * 100, ".0f", 1),
+        _diff("工业消费", "万吨", latest["corn_industrial_consumption_mmt"] * 100, prev["corn_industrial_consumption_mmt"] * 100, ".0f", 1),
+        _diff("总消费", "万吨", latest["corn_total_consumption_mmt"] * 100, prev["corn_total_consumption_mmt"] * 100, ".0f", 1),
+        "",
+        _diff("进口量", "万吨", latest["corn_imports_mmt"] * 100, prev["corn_imports_mmt"] * 100, ".0f", 1),
+        "",
+    ]
+
+    surplus = (latest["corn_production_mmt"] - latest["corn_total_consumption_mmt"]) * 100
+    if surplus > 500:
+        bal = f"★★☆ 产大于需 {surplus:.0f}万吨 (供应偏宽松)"
+    elif surplus < -1000:
+        bal = f"☆☆☆ 产不足需 {abs(surplus):.0f}万吨 (供应偏紧)"
+    else:
+        bal = f"★☆☆ 产需基本平衡 ({surplus:+.0f}万吨)"
+    lines.append(f"  产需平衡: {bal}")
+
+    notes = latest.get("notes", "")
+    if notes and not pd.isna(notes):
+        lines.append(f"  备注: {notes}")
+    lines.append("  数据来源: 农业农村部 CASDE + chinagrain.cn 转载")
+    return "\n".join(lines)
+
+
+def get_supply_demand_summary() -> str:
+    parts = []
+    try:
+        parts.append(get_inventory_summary())
+    except Exception as e:
+        parts.append(f"【库存】读取失败: {e}")
+    try:
+        parts.append(get_wasde_summary())
+    except Exception as e:
+        parts.append(f"【USDA】读取失败: {e}")
+    try:
+        parts.append(get_casde_summary())
+    except Exception as e:
+        parts.append(f"【CASDE】读取失败: {e}")
+    return "\n".join(parts)
+
+
 def generate_final_report(feature_names, ai_weights, ai_reasoning, ai_summary,
-                          seasonal_info, news_brief, sd_analysis, live_data, used_ai):
+                          seasonal_info, news_brief, sd_analysis, live_data, used_ai,
+                          supply_demand_summary=""):
     lines = [
         "=" * 68,
         f"  玉米期货 AI 权重分析报告 (真实新闻版)",
@@ -457,6 +740,8 @@ def generate_final_report(feature_names, ai_weights, ai_reasoning, ai_summary,
         f"  关键期:{'是★' if seasonal_info['is_critical'] else '否'}",
         "", live_data, "",
     ]
+    if supply_demand_summary:
+        lines += [supply_demand_summary, ""]
     if used_ai:
         lines += ["【AI 权重摘要】", f"  {ai_summary}", "", "【权重分配】"]
         for name, w in sorted(ai_weights.items(), key=lambda x: x[1], reverse=True):
@@ -472,7 +757,8 @@ def generate_final_report(feature_names, ai_weights, ai_reasoning, ai_summary,
     if news_brief and "未能获取" not in news_brief:
         lines += ["", "【真实新闻情报 (akshare/东方财富)】", news_brief[:2000]]
     lines += ["", "─" * 68,
-              f"  新闻来源: akshare stock_news_em (6只农业股, 真实+时间戳)",
+              f"  数据来源: akshare/东方财富(期货库存) + USDA FAS PSD(全球供需) + 农业农村部 CASDE(中国供需)",
+              f"  新闻来源: akshare stock_news_em (6只农业股, 真实+时间戳) + 新浪财经",
               f"  分析引擎: {'DeepSeek API' if used_ai else '规则引擎 (离线模式)'}",
               "─" * 68]
     return "\n".join(lines)

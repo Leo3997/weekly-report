@@ -24,6 +24,7 @@ from news_intelligence import (
     fetch_news_brief,
     analyze_supply_demand_current,
     get_live_anomaly_data,
+    get_supply_demand_summary,
     DEEPSEEK_API_KEY,
 )
 
@@ -38,6 +39,10 @@ def main():
                 report_date = datetime.strptime(sys.argv[i + 1], "%Y-%m-%d").date()
             except ValueError:
                 pass
+
+    if not offline and not any(a == "--skip-update" for a in sys.argv):
+        from update_data import update_all
+        update_all()
 
     seasonal_info = get_season_info(report_date)
     use_ai = bool(DEEPSEEK_API_KEY and not offline)
@@ -56,6 +61,12 @@ def main():
     ai_weights = {}
     ai_reasoning = {}
     ai_summary = ""
+    supply_demand_summary = ""
+
+    print("[0/4] 读取供需库存数据 (USDA/CASDE/期货库存) ...")
+    supply_demand_summary = get_supply_demand_summary()
+    print(f"  ✓ 已读取供需库存数据")
+    print()
 
     if use_ai:
         print("[0/3] 读取最新实测天气/土壤数据 ...")
@@ -70,9 +81,9 @@ def main():
         sd_analysis = analyze_supply_demand_current(live_data)
         print(f"  {'✓' if sd_analysis else '✗'} {'已获取' if sd_analysis else '失败'}")
 
-        print("[3/3] 正在调用 DeepSeek 生成特征权重建议 (基于实测+新闻)...")
+        print("[3/3] 正在调用 DeepSeek 生成特征权重建议 (基于实测+新闻+供需)...")
         ai_summary, ai_weights, ai_reasoning = generate_weight_proposal(
-            FEATURE_COLS, seasonal_info, live_data, news_brief,
+            FEATURE_COLS, seasonal_info, live_data, news_brief, supply_demand_summary,
         )
         print(f"  ✓ AI 分析了 {len(ai_weights)} 个特征的权重")
     else:
@@ -92,6 +103,7 @@ def main():
     report = generate_final_report(
         FEATURE_COLS, ai_weights, ai_reasoning, ai_summary,
         seasonal_info, news_brief, sd_analysis, live_data, use_ai,
+        supply_demand_summary,
     )
 
     with open(REPORT_PATH, "w", encoding="utf-8") as f:

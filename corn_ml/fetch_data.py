@@ -43,7 +43,7 @@ def fetch_spot_basis() -> str:
     import akshare as ak
     print("[2/4] 拉取玉米现货 + 基差 (akshare) ...", end=" ", flush=True)
     try:
-        df = ak.futures_spot_price_daily(start_day="20220101", end_day="20260507", vars_list=["C"])
+        df = ak.futures_spot_price_daily(start_day="20220101", end_day="20260517", vars_list=["C"])
         if df.empty:
             raise ValueError("empty")
     except Exception:
