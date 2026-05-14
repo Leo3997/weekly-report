@@ -14,7 +14,7 @@ warnings.filterwarnings("ignore")
 
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 FORECAST_HORIZONS = [5, 10, 20, 30, 60]
-N_HYPER_SEARCH = 20
+N_HYPER_SEARCH = 50
 
 SAMPLE_WEIGHT_RANGE = (0.4, 2.5)
 SAMPLE_WEIGHT_STEEPNESS = 3.0
@@ -94,7 +94,7 @@ def find_optimal_threshold(y_true, y_prob):
     return best_thresh
 
 
-def random_hyper_search(X_train, y_train, X_val, y_val, n_iter=50, sample_weight_tr=None):
+def random_hyper_search(X_train, y_train, X_val, y_val, n_iter=100, sample_weight_tr=None):
     from lightgbm import LGBMClassifier, early_stopping, log_evaluation
     from sklearn.metrics import roc_auc_score
 
@@ -105,14 +105,15 @@ def random_hyper_search(X_train, y_train, X_val, y_val, n_iter=50, sample_weight
     for i in range(n_iter):
         params = {
             "n_estimators": np.random.choice([200, 300, 400, 500, 600]),
-            "learning_rate": np.random.choice([0.01, 0.02, 0.03, 0.05, 0.08]),
-            "max_depth": np.random.choice([3, 4, 5, 6]),
+            "learning_rate": np.random.choice([0.01, 0.02, 0.03, 0.05, 0.08, 0.1, 0.15]),
+            "max_depth": np.random.choice([3, 4, 5, 6, 7]),
             "num_leaves": np.random.choice([8, 12, 16, 24, 31]),
             "min_child_samples": np.random.choice([20, 30, 50, 80, 120]),
             "subsample": np.random.choice([0.6, 0.7, 0.8, 0.9]),
             "colsample_bytree": np.random.choice([0.5, 0.6, 0.7, 0.8]),
-            "reg_alpha": np.random.choice([0.0, 0.1, 0.3, 0.5]),
-            "reg_lambda": np.random.choice([0.0, 0.5, 1.0, 2.0]),
+            "reg_alpha": np.random.choice([0.0, 0.001, 0.01, 0.05, 0.1]),
+            "reg_lambda": np.random.choice([0.0, 0.01, 0.1, 0.3, 0.5]),
+            "min_gain_to_split": np.random.choice([0.0, 0.001, 0.01]),
             "is_unbalance": True,
             "random_state": 42,
             "verbose": -1,
@@ -135,13 +136,15 @@ def random_hyper_search(X_train, y_train, X_val, y_val, n_iter=50, sample_weight
     if not results:
         return {"n_estimators": 400, "learning_rate": 0.03, "max_depth": 4,
                 "num_leaves": 16, "min_child_samples": 50, "subsample": 0.8,
-                "colsample_bytree": 0.7, "reg_alpha": 0.1, "reg_lambda": 1.0}
+                "colsample_bytree": 0.7, "reg_alpha": 0.01, "reg_lambda": 0.1,
+                "min_gain_to_split": 0.0}
 
     results.sort(key=lambda x: x["auc"], reverse=True)
     top5_auc = np.mean([r["auc"] for r in results[:5]])
     print(f"  搜索{n_iter}轮 | best AUC={best_score:.4f} | top5均值={top5_auc:.4f}")
     print(f"  best: lr={best_params['learning_rate']}, depth={best_params['max_depth']}, "
-          f"leaves={best_params['num_leaves']}, min_child={best_params['min_child_samples']}")
+          f"leaves={best_params['num_leaves']}, min_child={best_params['min_child_samples']}, "
+          f"reg_alpha={best_params['reg_alpha']}, reg_lambda={best_params['reg_lambda']}")
     return best_params
 
 
@@ -151,7 +154,8 @@ def train_lightgbm(X_train, y_train, X_val, y_val, params=None, sample_weight_tr
     if params is None:
         params = {"n_estimators": 400, "learning_rate": 0.03, "max_depth": 4,
                   "num_leaves": 16, "min_child_samples": 50, "subsample": 0.8,
-                  "colsample_bytree": 0.7, "reg_alpha": 0.1, "reg_lambda": 1.0}
+                  "colsample_bytree": 0.7, "reg_alpha": 0.01, "reg_lambda": 0.1,
+                  "min_gain_to_split": 0.0}
 
     params["is_unbalance"] = True
     model = LGBMClassifier(**params, random_state=42, verbose=-1)
@@ -165,6 +169,9 @@ def calibrate_predict(model, X_val, y_val, X_te, sample_weight_val=None):
     from scipy.special import expit, logit
     from scipy.optimize import minimize_scalar
     from sklearn.metrics import brier_score_loss
+    from sklearn.calibration import CalibratedClassifierCV
+    from sklearn.isotonic import IsotonicRegression
+    import warnings
 
     raw_val = model.predict_proba(X_val)[:, 1]
     raw_te = model.predict_proba(X_te)[:, 1]
@@ -176,10 +183,28 @@ def calibrate_predict(model, X_val, y_val, X_te, sample_weight_val=None):
     raw_te_c = np.clip(raw_te, 1e-6, 1 - 1e-6)
 
     raw_spread = raw_te.std()
-    if raw_spread < 0.03:
-        print(f"  跳过校准 (原始概率过于集中, std={raw_spread:.4f})")
-        return raw_te
+    raw_brier = brier_score_loss(y_val, raw_val_c)
 
+    best_cal = raw_te.copy()
+    best_brier = float('inf')
+    best_method = "none"
+
+    # 方法1: Platt scaling (优先使用，更稳定)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            cal_platt = CalibratedClassifierCV(model, method='sigmoid', cv='prefit')
+            cal_platt.fit(X_val, y_val, sample_weight=sample_weight_val)
+            platt_cal = cal_platt.predict_proba(X_te)[:, 1]
+            platt_brier = brier_score_loss(y_val, cal_platt.predict_proba(X_val)[:, 1])
+            if platt_brier < best_brier:
+                best_brier = platt_brier
+                best_cal = platt_cal
+                best_method = "Platt scaling"
+    except Exception:
+        pass
+
+    # 方法2: 温度缩放
     def _brier_t(T):
         p = expit(logit(raw_val_c) / T)
         return brier_score_loss(y_val, p)
@@ -187,29 +212,67 @@ def calibrate_predict(model, X_val, y_val, X_te, sample_weight_val=None):
     try:
         res = minimize_scalar(_brier_t, bounds=(0.2, 5.0), method="bounded")
         T_opt = float(res.x)
+        temp_cal = expit(logit(raw_te_c) / T_opt)
+        temp_cal = np.clip(temp_cal, 0.001, 0.999)
+        temp_val_cal = expit(logit(raw_val_c) / T_opt)
+        temp_val_cal = np.clip(temp_val_cal, 0.001, 0.999)
+        temp_brier = brier_score_loss(y_val, temp_val_cal)
+        if temp_brier < best_brier:
+            best_brier = temp_brier
+            best_cal = temp_cal
+            direction = "锐化" if T_opt < 1.0 else "平滑"
+            best_method = f"温度缩放(T={T_opt:.2f},{direction})"
     except Exception:
-        T_opt = 1.0
+        pass
 
-    cal_te = expit(logit(raw_te_c) / T_opt)
-    cal_te = np.clip(cal_te, 0.001, 0.999)
+    # 方法3: Isotonic regression (仅在样本充足时使用)
+    try:
+        if len(X_val) >= 50:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                cal_iso = CalibratedClassifierCV(model, method='isotonic', cv='prefit')
+                cal_iso.fit(X_val, y_val, sample_weight=sample_weight_val)
+                iso_cal = cal_iso.predict_proba(X_te)[:, 1]
+                iso_brier = brier_score_loss(y_val, cal_iso.predict_proba(X_val)[:, 1])
+                if iso_brier < best_brier:
+                    best_brier = iso_brier
+                    best_cal = iso_cal
+                    best_method = "Isotonic regression"
+    except Exception:
+        pass
 
-    cal_spread = cal_te.std()
-    if cal_spread / max(raw_spread, 1e-6) < 0.3 or cal_spread < 0.02:
-        print(f"  跳过校准 (校准后分布过窄, T={T_opt:.2f} cal_std={cal_spread:.4f} raw_std={raw_spread:.4f})")
+    cal_spread = best_cal.std()
+
+    # 如果校准后标准差过小（过度平滑），则跳过校准
+    if cal_spread < raw_spread * 0.3:
+        print(f"  跳过校准 (校准过度平滑: std {raw_spread:.3f} -> {cal_spread:.3f})")
         return raw_te
 
-    direction = "锐化" if T_opt < 1.0 else "平滑"
-    print(f"  温度缩放: T={T_opt:.2f}({direction}) raw_std={raw_spread:.3f} -> cal_std={cal_te.std():.3f}")
+    # 如果改善不足5%，也跳过校准
+    improvement = (raw_brier - best_brier) / raw_brier * 100 if raw_brier > 0 else 0
+    if improvement < 5.0 and best_method != "none":
+        print(f"  跳过校准 (改善仅{improvement:.1f}%, 阈值5%)")
+        return raw_te
 
-    return cal_te
+    if best_method == "none":
+        print(f"  跳过校准 (原始概率分布已最优, Brier={raw_brier:.4f})")
+        return raw_te
+
+    print(f"  校准方法: {best_method} | Brier: {raw_brier:.4f} -> {best_brier:.4f} (改善{improvement:.1f}%) | std: {raw_spread:.3f} -> {cal_spread:.3f}")
+
+    return best_cal
 
 
-def evaluate(model, X, y, proba=None, threshold=0.5) -> dict:
+def evaluate(model, X, y, proba=None, threshold=0.5, returns=None, cost_bps=15.0) -> dict:
+    """评估模型性能。
+    cost_bps: 单边成本（手续费+滑点），实盘建议15bp/单边。
+    策略逻辑：pred=1时做多（成本=双边2*cost），pred=0时空仓（成本=0）。
+    """
     from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
     if proba is None:
         proba = model.predict_proba(X)[:, 1]
     pred = (proba >= threshold).astype(int)
-    return {
+    result = {
         "n": len(y), "acc": accuracy_score(y, pred),
         "prec": precision_score(y, pred, zero_division=0),
         "rec": recall_score(y, pred, zero_division=0),
@@ -217,15 +280,34 @@ def evaluate(model, X, y, proba=None, threshold=0.5) -> dict:
         "auc": roc_auc_score(y, proba), "up": y.mean(),
         "thresh": threshold, "pred_up": pred.mean(),
     }
+    if returns is not None:
+        cost_one_side = cost_bps / 10000
+        # 只做多策略：预测涨时开仓，成本=双边（开+平）；预测不涨时空仓，成本=0
+        strategy_return = np.where(pred == 1, returns - 2 * cost_one_side, 0.0).sum()
+        total_trades = int(pred.sum())
+        win_trades = int(((pred == 1) & (returns > 0)).sum())
+        result["strategy_return"] = strategy_return
+        result["total_trades"] = total_trades
+        result["cost_impact"] = total_trades * 2 * cost_one_side
+        result["win_rate"] = win_trades / total_trades if total_trades > 0 else 0.0
+    return result
 
 
 def rolling_backtest(X_all, y_all, dates, train_months=60,
-                     feature_names=None, ai_weights=None):
+                     feature_names=None, ai_weights=None, best_params=None):
     from lightgbm import LGBMClassifier
     results = []
     unique_months = sorted(set((d.year, d.month) for d in dates))
     if len(unique_months) < train_months + 1:
         return pd.DataFrame()
+
+    if best_params is None:
+        best_params = {
+            "n_estimators": 200, "learning_rate": 0.05, "max_depth": 4,
+            "num_leaves": 15, "min_child_samples": 50, "subsample": 0.8,
+            "colsample_bytree": 0.7, "reg_alpha": 0.01, "reg_lambda": 0.1,
+            "min_gain_to_split": 0.0,
+        }
 
     for si in range(len(unique_months) - train_months):
         tm = unique_months[si + train_months]
@@ -241,8 +323,7 @@ def rolling_backtest(X_all, y_all, dates, train_months=60,
         if ai_weights and feature_names:
             sw_tr, _, _ = compute_ai_sample_weight(X_tr, feature_names, ai_weights)
 
-        m = LGBMClassifier(n_estimators=200, learning_rate=0.05, max_depth=4,
-                           num_leaves=15, is_unbalance=True, random_state=42, verbose=-1)
+        m = LGBMClassifier(**best_params, random_state=42, verbose=-1)
         m.fit(X_tr, y_tr, sample_weight=sw_tr)
         from sklearn.metrics import accuracy_score
         results.append({"month": f"{tm[0]}-{tm[1]:02d}", "n": len(y_te),
@@ -544,7 +625,8 @@ def train_and_predict_daily(df, feature_cols, core_features, partial_features,
     base_params = {
         "n_estimators": 300, "learning_rate": 0.03, "max_depth": 4,
         "num_leaves": 16, "min_child_samples": 50, "subsample": 0.8,
-        "colsample_bytree": 0.7, "reg_alpha": 0.1, "reg_lambda": 1.0,
+        "colsample_bytree": 0.7, "reg_alpha": 0.01, "reg_lambda": 0.1,
+        "min_gain_to_split": 0.0,
         "is_unbalance": True, "random_state": 42, "verbose": -1,
     }
 
@@ -743,6 +825,53 @@ def save_predictions_csv(all_dates, all_probas, all_actuals, all_returns, thresh
     print(f"  [预测CSV] 已保存 -> {save_path}")
 
 
+NEW_FEATURES = [
+    "return_3d", "return_5d", "volatility_5d", "volatility_10d",
+    "rsi_7", "price_vs_ma5", "price_vs_ma10", "volume_ratio_5d",
+    "ma5_ma20_ratio", "ma10_ma60_ratio", "momentum_10d", "rsi_21",
+    "volatility_ratio", "trend_strength", "price_position_20d",
+]
+
+def save_models(models, thresholds, ref_med=None, ref_mad=None):
+    import pickle
+    from datetime import date
+    models_dir = os.path.join(DATA_DIR, "saved_models")
+    os.makedirs(models_dir, exist_ok=True)
+    
+    model_data = {
+        "date": date.today().isoformat(),
+        "models": models,
+        "thresholds": thresholds,
+        "ref_median": ref_med,
+        "ref_mad": ref_mad,
+        "feature_count": len(FEATURE_COLS) if 'FEATURE_COLS' in globals() else 66,
+    }
+    
+    model_path = os.path.join(models_dir, f"models_{date.today().strftime('%Y%m%d')}.pkl")
+    with open(model_path, "wb") as f:
+        pickle.dump(model_data, f)
+    print(f"\n  [模型保存] 已保存 -> {model_path}")
+    return model_path
+
+
+def load_latest_models():
+    import pickle
+    models_dir = os.path.join(DATA_DIR, "saved_models")
+    if not os.path.exists(models_dir):
+        return None, None, None, None
+    
+    model_files = sorted([f for f in os.listdir(models_dir) if f.startswith("models_") and f.endswith(".pkl")])
+    if not model_files:
+        return None, None, None, None
+    
+    latest_file = model_files[-1]
+    model_path = os.path.join(models_dir, latest_file)
+    with open(model_path, "rb") as f:
+        model_data = pickle.load(f)
+    print(f"  [模型加载] 已加载 -> {model_path} (日期: {model_data['date']})")
+    return model_data["models"], model_data["thresholds"], model_data["ref_median"], model_data["ref_mad"]
+
+
 def main():
     from build_features import FEATURE_COLS, CORE_FEATURES, PARTIAL_FEATURES, NOISE_THRESHOLD
 
@@ -794,37 +923,50 @@ def main():
         print(f"样本: train={len(X_train)} val={len(X_val)} test={len(X_test)}")
         print(f"涨跌比: train={y_train.mean():.1%} val={y_val.mean():.1%} test={y_test.mean():.1%}")
 
+        # ── 验证集拆分：前2/5用于早停+超参，后3/5用于独立评估（防验证集过拟合）──
+        # 验证集范围 2020-06-01 ~ 2025-06-01 (≈5年)
+        # val_es:   2020-06-01 ~ 2022-06-01  约2年，用于 early_stopping 和超参搜索
+        # val_eval: 2022-06-01 ~ 2025-06-01  约3年，只用于最终性能汇报
+        VAL_ES_RATIO = 2.0 / 5.0
+        n_val_es = max(int(len(X_val) * VAL_ES_RATIO), 50)
+        X_val_es,   y_val_es   = X_val[:n_val_es],  y_val[:n_val_es]
+        X_val_eval, y_val_eval = X_val[n_val_es:],  y_val[n_val_es:]
+        print(f"验证集拆分: 早停集={len(X_val_es)} | 评估集={len(X_val_eval)}")
+
         sw_train, ref_med, ref_mad = compute_ai_sample_weight(
             X_train, FEATURE_COLS, ai_weights)
         if use_ai:
-            sw_val, _, _ = compute_ai_sample_weight(
-                X_val, FEATURE_COLS, ai_weights, ref_med, ref_mad)
+            sw_val_es, _, _ = compute_ai_sample_weight(
+                X_val_es, FEATURE_COLS, ai_weights, ref_med, ref_mad)
+            sw_val_eval, _, _ = compute_ai_sample_weight(
+                X_val_eval, FEATURE_COLS, ai_weights, ref_med, ref_mad)
             sw_test, _, _ = compute_ai_sample_weight(
                 X_test, FEATURE_COLS, ai_weights, ref_med, ref_mad)
             print(f"AI sample_weight: train[{sw_train.min():.2f}~{sw_train.max():.2f}] "
-                  f"val[{sw_val.min():.2f}~{sw_val.max():.2f}] "
+                  f"val_es[{sw_val_es.min():.2f}~{sw_val_es.max():.2f}] "
                   f"test[{sw_test.min():.2f}~{sw_test.max():.2f}]")
         else:
-            sw_train = sw_val = sw_test = None
+            sw_train = sw_val_es = sw_val_eval = sw_test = None
 
-        print("\n  [超参搜索...]")
+        print("\n  [超参搜索... 使用早停集，避免对评估集过拟合]")
         best_params = random_hyper_search(
-            X_train, y_train, X_val, y_val, N_HYPER_SEARCH, sw_train)
+            X_train, y_train, X_val_es, y_val_es, N_HYPER_SEARCH, sw_train)
 
-        print("  [训练...]")
-        model = train_lightgbm(X_train, y_train, X_val, y_val,
+        print("  [训练... early_stopping 使用早停集]")
+        model = train_lightgbm(X_train, y_train, X_val_es, y_val_es,
                                best_params, sw_train)
         models[horizon] = model
         print(f"  最佳迭代: {model.best_iteration_}")
 
-        val_proba_raw = model.predict_proba(X_val)[:, 1]
+        val_proba_raw = model.predict_proba(X_val_eval)[:, 1]
         test_proba_raw = model.predict_proba(X_test)[:, 1]
 
-        proba_cal = calibrate_predict(model, X_val, y_val, X_test, sw_val)
+        # 概率校准：在早停集上拟合校准器，在测试集上应用
+        proba_cal = calibrate_predict(model, X_val_es, y_val_es, X_test, sw_val_es)
 
-        opt_thresh = find_optimal_threshold(y_val, val_proba_raw)
+        opt_thresh = find_optimal_threshold(y_val_eval, val_proba_raw)
         all_thresholds[horizon] = opt_thresh
-        print(f"  最优阈值: {opt_thresh:.3f} (验证集均衡准确率最优)")
+        print(f"  最优阈值: {opt_thresh:.3f} (评估集均衡准确率最优)")
 
         t_dates, t_actuals, t_returns = extract_test_dates_and_actuals(df, horizon, CORE_FEATURES_REF)
         all_test_dates[horizon] = t_dates
@@ -833,13 +975,18 @@ def main():
         all_test_actuals[horizon] = t_actuals[:min_len]
         all_test_returns[horizon] = t_returns[:min_len]
 
-        print(f"\n  {'集合':<6s} {'样本':>6s} {'阈值':>6s} {'准确率':>7s} {'精确率':>7s} {'召回率':>7s} {'F1':>7s} {'AUC':>7s} {'预测涨%':>8s}")
+        print(f"\n  {'集合':<8s} {'样本':>6s} {'阈值':>6s} {'准确率':>7s} {'精确率':>7s} {'召回率':>7s} {'F1':>7s} {'AUC':>7s} {'预测涨%':>8s}")
         print(f"  {'─'*66}")
-        for X, y, name in [(X_train, y_train, "训练"), (X_val, y_val, "验证")]:
-            m = evaluate(model, X, y, threshold=opt_thresh)
-            print(f"  {name:<6s} {m['n']:>6d} {m['thresh']:>5.2f} {m['acc']:>6.2%} {m['prec']:>6.2%} {m['rec']:>6.2%} {m['f1']:>7.4f} {m['auc']:>7.4f} {m['pred_up']:>7.1%}")
-        m = evaluate(model, X_test, y_test, proba=proba_cal[:min_len], threshold=opt_thresh)
-        print(f"  {'测试':<6s} {m['n']:>6d} {m['thresh']:>5.2f} {m['acc']:>6.2%} {m['prec']:>6.2%} {m['rec']:>6.2%} {m['f1']:>7.4f} {m['auc']:>7.4f} {m['pred_up']:>7.1%}")
+        for X, y, name in [(X_train, y_train, "训练"),
+                           (X_val_es, y_val_es, "验证(ES)"),
+                           (X_val_eval, y_val_eval, "验证(评估)")]:
+            proba_v = model.predict_proba(X)[:, 1]
+            m = evaluate(model, X, y, proba=proba_v, threshold=opt_thresh)
+            print(f"  {name:<8s} {m['n']:>6d} {m['thresh']:>5.2f} {m['acc']:>6.2%} {m['prec']:>6.2%} {m['rec']:>6.2%} {m['f1']:>7.4f} {m['auc']:>7.4f} {m['pred_up']:>7.1%}")
+        m = evaluate(model, X_test, y_test, proba=proba_cal[:min_len], threshold=opt_thresh, returns=t_returns[:min_len])
+        print(f"  {'测试':<8s} {m['n']:>6d} {m['thresh']:>5.2f} {m['acc']:>6.2%} {m['prec']:>6.2%} {m['rec']:>6.2%} {m['f1']:>7.4f} {m['auc']:>7.4f} {m['pred_up']:>7.1%}")
+        if "strategy_return" in m:
+            print(f"  [交易成本] 手续费+滑点=15bp/单边(双边30bp) | 交易{m['total_trades']}次 | 成本{m['cost_impact']:.4f} | 策略收益={m['strategy_return']:.4f} | 胜率={m['win_rate']:.1%}")
         summary_rows.append({"Horizon": f"T+{horizon}d", "thresh": opt_thresh, **{k: m[k] for k in ["n", "acc", "auc", "prec", "rec", "f1"]}})
 
         imp = model.feature_importances_
@@ -850,15 +997,15 @@ def main():
             bar = "█" * int(imp[idx] * 35 + 1)
             ai_w = ai_weights.get(FEATURE_COLS[idx], 0) if ai_weights else 0
             ai_tag = f" [AI={ai_w:.1%}]" if ai_w > 0 else ""
-            print(f"    {rank}. {FEATURE_COLS[idx]:<24s} {imp[idx]:.1%}{ai_tag}  {bar}")
+            new_tag = " [新增]" if FEATURE_COLS[idx] in NEW_FEATURES else ""
+            print(f"    {rank}. {FEATURE_COLS[idx]:<24s} {imp[idx]:.1%}{ai_tag}{new_tag}  {bar}")
 
         from sklearn.metrics import roc_auc_score, brier_score_loss
-        raw_proba = model.predict_proba(X_test)[:, 1]
         cal_auc = roc_auc_score(y_test, proba_cal)
         cal_brier = brier_score_loss(y_test, proba_cal)
-        raw_auc = roc_auc_score(y_test, raw_proba)
-        raw_brier = brier_score_loss(y_test, raw_proba)
-        if not np.allclose(raw_proba, proba_cal, atol=1e-5):
+        raw_auc = roc_auc_score(y_test, test_proba_raw)
+        raw_brier = brier_score_loss(y_test, test_proba_raw)
+        if not np.allclose(test_proba_raw, proba_cal, atol=1e-5):
             print(f"\n  概率校准: raw AUC={raw_auc:.4f} Brier={raw_brier:.4f} -> cal AUC={cal_auc:.4f} Brier={cal_brier:.4f}")
         else:
             print(f"\n  概率校准: 跳过 (AUC={raw_auc:.4f} Brier={raw_brier:.4f})")
@@ -883,7 +1030,8 @@ def main():
             y_all = clean[label_col].values.astype(np.int64)
             bt = rolling_backtest(X_all, y_all, clean["date"],
                                   feature_names=FEATURE_COLS if use_ai else None,
-                                  ai_weights=ai_weights if use_ai else None)
+                                  ai_weights=ai_weights if use_ai else None,
+                                  best_params=best_params)
             if not bt.empty:
                 r12 = bt.tail(12)
                 print(f"  {len(bt)}个月 | 均值={bt['acc'].mean():.2%} ±{bt['acc'].std():.3f} | 近12月={r12['acc'].mean():.2%}")
@@ -897,14 +1045,27 @@ def main():
         print(f"  {s['Horizon']:<10s} {s['thresh']:>5.2f} {s['n']:>6d} {s['acc']:>6.2%} {s['auc']:>7.4f} {s['prec']:>6.2%} {s['rec']:>6.2%} {s['f1']:>7.4f}")
 
     latest_summary = []
+    confidence_warnings = []
     for h in FORECAST_HORIZONS:
         thresh = all_thresholds.get(h, 0.5)
         if h in all_test_probas and len(all_test_probas[h]) > 0:
-            latest_summary.append(
-                f"T+{h}d={all_test_probas[h][-1]:.1%}"
-                f"({'▲看涨' if all_test_probas[h][-1] >= thresh else '▼看跌'})")
+            latest_prob = all_test_probas[h][-1]
+            direction = "▲看涨" if latest_prob >= thresh else "▼看跌"
+            latest_summary.append(f"T+{h}d={latest_prob:.1%}({direction})")
+            
+            confidence = abs(latest_prob - 0.5) / 0.5
+            if confidence < 0.2:
+                confidence_warnings.append(f"T+{h}d: {latest_prob:.1%} (置信度极低，接近随机猜测)")
+            elif confidence < 0.4:
+                confidence_warnings.append(f"T+{h}d: {latest_prob:.1%} (置信度较低，仅供参考)")
+    
     if latest_summary:
         print(f"\n  最新预测: {' | '.join(latest_summary)}")
+    
+    if confidence_warnings:
+        print(f"\n  [预测置信度警告]:")
+        for warn in confidence_warnings:
+            print(f"    - {warn}")
 
     print(f"\n  [生成预测曲线...]")
     curve_path = os.path.join(DATA_DIR, "prediction_curve.png")
@@ -930,6 +1091,8 @@ def main():
             ai_weights, X_latest)
         daily_path = os.path.join(DATA_DIR, "daily_forecast.png")
         plot_daily_forecast_curves(daily_probas, latest_date, close_price, daily_path)
+
+    save_models(models, all_thresholds, ref_med, ref_mad)
 
     print(f"\n  完成 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*66}")

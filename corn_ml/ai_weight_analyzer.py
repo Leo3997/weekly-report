@@ -65,35 +65,35 @@ def main():
 
     print("[0/4] 读取供需库存数据 (USDA/CASDE/期货库存) ...")
     supply_demand_summary = get_supply_demand_summary()
-    print(f"  ✓ 已读取供需库存数据")
+    print(f"  [OK] 已读取供需库存数据")
     print()
 
     if use_ai:
         print("[0/3] 读取最新实测天气/土壤数据 ...")
         live_data = get_live_anomaly_data()
-        print(f"  ✓ 已读取 {len(live_data)} 字符的实测数据")
+        print(f"  [OK] 已读取 {len(live_data)} 字符的实测数据")
 
         print("[1/3] 正在从百度搜索抓取真实新闻 ...")
         news_brief = fetch_news_brief()
-        print(f"  {'✓' if news_brief else '✗'} {'已获取' if news_brief else '失败'}")
+        print(f"  [{'OK' if news_brief else 'FAIL'}] {'已获取' if news_brief else '失败'}")
 
         print("[2/3] 正在调用 DeepSeek 分析供需格局 ...")
         sd_analysis = analyze_supply_demand_current(live_data)
-        print(f"  {'✓' if sd_analysis else '✗'} {'已获取' if sd_analysis else '失败'}")
+        print(f"  [{'OK' if sd_analysis else 'FAIL'}] {'已获取' if sd_analysis else '失败'}")
 
         print("[3/3] 正在调用 DeepSeek 生成特征权重建议 (基于实测+新闻+供需)...")
         ai_summary, ai_weights, ai_reasoning = generate_weight_proposal(
             FEATURE_COLS, seasonal_info, live_data, news_brief, supply_demand_summary,
         )
-        print(f"  ✓ AI 分析了 {len(ai_weights)} 个特征的权重")
+        print(f"  [OK] AI 分析了 {len(ai_weights)} 个特征的权重")
     else:
         print("[离线模式] 使用季节规则引擎分配权重")
         live_data = get_live_anomaly_data()
-        print(f"  ✓ 已读取实测数据 (供报告展示)")
+        print(f"  [OK] 已读取实测数据 (供报告展示)")
 
         print("[离线模式] 正在抓取真实新闻 (akshare) ...")
         news_brief = fetch_news_brief()
-        print(f"  {'✓' if news_brief else '✗'} {'已获取' if news_brief else '失败'}")
+        print(f"  [{'OK' if news_brief else 'FAIL'}] {'已获取' if news_brief else '失败'}")
 
         ai_weights = rule_based_weights(FEATURE_COLS, seasonal_info)
 

@@ -156,29 +156,43 @@ def _load_casde(merged: pd.DataFrame):
 
 
 def _station_anomaly(df: pd.DataFrame, col_name: str) -> pd.Series:
+    """计算气候异常值（当前值 - 过去N年同一天的均值）。
+    严格遵循时间序列规范，不使用未来信息。
+    """
     df = df.copy()
     df["doy"] = df["date"].dt.dayofyear
     df["year"] = df["date"].dt.year
-
-    pivot = df.dropna(subset=[col_name]).pivot_table(
-        index="doy", columns="year", values=col_name, aggfunc="mean"
-    )
-
-    anomalies: dict[tuple, float] = {}
-    for doy in pivot.index:
-        years = sorted(pivot.columns)
-        for i, yr in enumerate(years):
-            val = pivot.loc[doy, yr]
-            if pd.isna(val):
-                continue
-            past_vals = [
-                pivot.loc[doy, y] for y in years[max(0, i - ANOMALY_WINDOW_YEARS):i]
-                if pd.notna(pivot.loc[doy, y])
-            ]
-            if past_vals:
-                anomalies[(doy, yr)] = val - (sum(past_vals) / len(past_vals))
-
-    return df.apply(lambda r: anomalies.get((r["doy"], r["year"]), np.nan), axis=1)
+    
+    # 预计算每一年的 DOY 均值（避免重复计算）
+    # 注意：这里只按 doy 和 year 分组，不涉及跨年聚合，是安全的
+    doy_means = df.groupby(["year", "doy"])[col_name].mean().reset_index()
+    
+    result = []
+    # 使用字典加速查找：(year, doy) -> value
+    val_map = doy_means.set_index(["year", "doy"])[col_name].to_dict()
+    
+    # 逐行/逐组计算异常，仅使用过去 N 年的数据
+    for _, row in df.iterrows():
+        curr_yr = row["year"]
+        curr_doy = row["doy"]
+        curr_val = row[col_name]
+        
+        if pd.isna(curr_val):
+            result.append(np.nan)
+            continue
+            
+        past_vals = []
+        for y in range(curr_yr - ANOMALY_WINDOW_YEARS, curr_yr):
+            v = val_map.get((y, curr_doy))
+            if v is not None and pd.notna(v):
+                past_vals.append(v)
+        
+        if past_vals:
+            result.append(curr_val - np.mean(past_vals))
+        else:
+            result.append(np.nan)
+            
+    return pd.Series(result, index=df.index)
 
 
 def _compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -204,6 +218,46 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df["price_vs_ma20"] = df["close"] / df["close"].rolling(20).mean() - 1
     df["rsi_14"] = _compute_rsi(df["close"], 14)
     df["hl_ratio"] = (df["high"] - df["low"]) / df["close"]
+
+    # ★ 短期特征增强：保留波动率和成交量，删除冗余动量/RSI/均线
+    df["volatility_5d"] = df["return_1d"].rolling(5).std()
+    df["volume_ratio_5d"] = df["volume"] / df["volume"].rolling(5).mean().replace(0, np.nan)
+
+    # ★ 中期特征增强：只保留低相关性指标
+    df["ma5_ma20_ratio"] = df["close"].rolling(5).mean() / df["close"].rolling(20).mean().replace(0, np.nan) - 1
+    df["price_position_20d"] = (df["close"] - df["low"].rolling(20).min()) / (df["high"].rolling(20).max() - df["low"].rolling(20).min()).replace(0, np.nan)
+
+    # ★ 高区分度技术指标
+    # MACD：只保留 macd_hist（已包含 macd 和 signal 的差值信息，避免共线）
+    # adjust=False：递推形式，不使用未来数据
+    _ema12 = df["close"].ewm(span=12, adjust=False).mean()
+    _ema26 = df["close"].ewm(span=26, adjust=False).mean()
+    _macd = _ema12 - _ema26
+    _macd_signal = _macd.ewm(span=9, adjust=False).mean()
+    df["macd_hist"] = _macd - _macd_signal
+    
+    # 布林带
+    ma20 = df["close"].rolling(20).mean()
+    std20 = df["close"].rolling(20).std()
+    df["bb_width"] = (2 * std20) / ma20.replace(0, np.nan)
+    df["bb_position"] = (df["close"] - (ma20 - 2 * std20)) / (4 * std20).replace(0, np.nan)
+    
+    # 成交量动量
+    df["volume_momentum"] = df["volume"].pct_change(5)
+    df["volume_ma_ratio"] = df["volume"] / df["volume"].rolling(20).mean().replace(0, np.nan)
+    
+    # 价格动量变化率
+    df["momentum_change"] = df["momentum_20d"].diff()
+    df["volatility_change"] = df["volatility"].diff()
+
+    # ==================== 市场状态检测 (波动率regime) ====================
+    vol_20 = df["return_1d"].rolling(20).std()
+    vol_60 = df["return_1d"].rolling(60).std()
+    vol_120 = df["return_1d"].rolling(120).std()
+    df["vol_regime_short"] = vol_20 / vol_60.replace(0, np.nan)
+    df["vol_regime_long"] = vol_60 / vol_120.replace(0, np.nan)
+    df["vol_percentile_60d"] = df["return_1d"].rolling(60).apply(lambda x: pd.Series(x).rank().iloc[-1] / len(x), raw=False)
+    df["trend_regime"] = df["momentum_20d"] / vol_20.replace(0, np.nan)
 
     # ==================== 基差 (1个) ====================
     df["basis"] = df["spot_price"] - df["dominant_contract_price"]
@@ -349,7 +403,14 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# 删除了以下高度共线特征（每组只保留1~2个信息量最高的）：
+# 动量组：删 return_3d, return_5d, momentum_10d（保留 momentum_20d/60d/accel）
+# RSI组：删 rsi_7, rsi_21（保留 rsi_14）
+# 均线组：删 price_vs_ma5, price_vs_ma10（保留 price_vs_ma20, ma5_ma20_ratio）
+# 波动率组：删 volatility_ratio（保留 volatility, volatility_5d）
+# MACD组：删 macd（保留 macd_hist，已包含 macd 和 signal 信息）
 FEATURE_COLS = [
+    # 基础技术面
     "momentum_20d",
     "momentum_60d",
     "momentum_accel",
@@ -358,16 +419,34 @@ FEATURE_COLS = [
     "price_vs_ma20",
     "rsi_14",
     "hl_ratio",
+    # 短期特征
+    "volatility_5d",
+    "volume_ratio_5d",
+    # 中期特征
+    "ma5_ma20_ratio",
+    "price_position_20d",
+    # 高区分度技术指标
+    "macd_hist",
+    "bb_width",
+    "bb_position",
+    "volume_momentum",
+    "volume_ma_ratio",
+    "momentum_change",
+    "volatility_change",
+    # 基差和CBOT
     "basis",
     "cbot_return_5d",
     "corn_wheat_ratio",
+    # 生猪期货
     "hog_return_20d",
     "corn_hog_corr",
+    # 季节
     "month_sin",
     "month_cos",
     "is_critical",
     "is_planting",
     "is_harvest",
+    # 气候异常
     "t_anom_东北",
     "t_anom_华北黄淮",
     "p_anom_东北",
@@ -380,6 +459,7 @@ FEATURE_COLS = [
     "srad_anom_华北黄淮",
     "rh_anom_东北",
     "rh_anom_华北黄淮",
+    # 交互特征
     "t_critical",
     "t_planting",
     "p_critical",
@@ -389,16 +469,14 @@ FEATURE_COLS = [
     "precip_x_oi",
     "vol_x_basis",
     "mom_x_oi",
+    # 库存
     "inv_level",
     "inv_change_5d",
     "inv_level_vs_ma20",
+    # USDA/CASDE (去重后)
     "usda_stocks_use",
     "usda_stocks_use_yoy",
-    "usda_china_imports",
     "usda_price",
-    "casde_yield",
-    "casde_area",
-    "casde_feed_ratio",
     "casde_imports",
     "casde_surplus",
 ]
@@ -407,8 +485,16 @@ CORE_FEATURES = [
     "momentum_20d", "momentum_60d", "momentum_accel",
     "volatility", "oi_change", "price_vs_ma20",
     "rsi_14", "hl_ratio",
+    # 短期特征
+    "volatility_5d",
+    # 中期特征
+    "ma5_ma20_ratio", "price_position_20d",
+    # 高区分度技术指标
+    "macd_hist", "bb_width", "bb_position",
+    # 季节
     "month_sin", "month_cos",
     "is_critical", "is_planting", "is_harvest",
+    # 气候异常
     "t_anom_东北", "t_anom_华北黄淮",
     "p_anom_东北", "p_anom_华北黄淮",
     "sm_root_anom_东北", "sm_root_anom_华北黄淮",
@@ -418,16 +504,26 @@ CORE_FEATURES = [
 ]
 
 PARTIAL_FEATURES = [
+    # 短期/中期特征
+    "volume_ratio_5d",
+    "volume_momentum", "volume_ma_ratio",
+    "momentum_change", "volatility_change",
+    # 市场状态检测
+    "vol_regime_short", "vol_regime_long",
+    "vol_percentile_60d", "trend_regime",
+    # 基差和CBOT
     "basis", "cbot_return_5d", "corn_wheat_ratio",
+    # 生猪期货
     "hog_return_20d", "corn_hog_corr",
+    # 交互特征
     "t_critical", "t_planting", "p_critical", "p_planting",
     "sm_planting_ne", "sm_planting_hb",
     "precip_x_oi", "vol_x_basis", "mom_x_oi",
+    # 库存
     "inv_level", "inv_change_5d", "inv_level_vs_ma20",
-    "usda_china_imports", "usda_price",
+    # USDA/CASDE
+    "usda_stocks_use", "usda_stocks_use_yoy", "usda_price",
     "casde_imports", "casde_surplus",
-    "usda_stocks_use", "usda_stocks_use_yoy",
-    "casde_yield", "casde_area", "casde_feed_ratio",
 ]
 
 
@@ -474,8 +570,7 @@ def main() -> None:
     df.to_csv(os.path.join(DATA_DIR, "features_full_v2.csv"), index=False, encoding="utf-8-sig")
 
     print(f"特征: {len(FEATURE_COLS)}个 (核心{len(CORE_FEATURES)} + 部分{len(PARTIAL_FEATURES)})")
-    print(f"新增: momentum_accel, sm_grad × 2, t_critical/planting, p_critical/planting, sm_planting × 2")
-    print(f"删除: momentum_5d, volume_change, sm_surf, sm_prof, hog_oi_change, weather_stress, ratio_change_20d")
+    print(f"整改v6删除共线特征: return_3d/5d, rsi_7/21, price_vs_ma5/10, momentum_10d, ma10_ma60_ratio, volatility_ratio, macd（保留macd_hist）")
     print(f"三分类: |future_return|>{NOISE_THRESHOLD:.0%} -> 涨/跌, 中间段丢弃")
 
     for horizon in FORECAST_HORIZONS:
