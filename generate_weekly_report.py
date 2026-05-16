@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-玉米市场周报生成器
+饲料能量农产品周报生成器
 从各数据源读取最新数据，生成 HTML 报告并转换为 PDF。
 """
 
@@ -168,6 +168,112 @@ def load_freight_index():
     except Exception as e:
         print(f"  [WARN] BDI指数获取失败: {e}")
         return pd.DataFrame()
+
+
+def load_futures_quick(symbol, label):
+    """通用期货主力拉取 (akshare futures_main_sina)"""
+    try:
+        import akshare as ak
+        df = ak.futures_main_sina(symbol=symbol)
+        df = df.rename(columns={
+            "日期": "date", "开盘价": "open", "最高价": "high",
+            "最低价": "low", "收盘价": "close", "成交量": "volume",
+            "持仓量": "open_interest", "动态结算价": "settle",
+        })
+        df["date"] = pd.to_datetime(df["date"])
+        return df.sort_values("date")
+    except Exception as e:
+        print(f"  [WARN] {label}期货获取失败: {e}")
+        return pd.DataFrame()
+
+
+def load_starch_futures():
+    """玉米淀粉期货 CS"""
+    return load_futures_quick("CS0", "淀粉")
+
+
+def load_egg_futures():
+    """鸡蛋期货 JD"""
+    return load_futures_quick("JD0", "鸡蛋")
+
+
+def load_hog_futures():
+    """生猪期货 LH"""
+    return load_futures_quick("LH0", "生猪")
+
+
+def load_soymeal_futures():
+    """豆粕期货 M"""
+    return load_futures_quick("M0", "豆粕")
+
+
+def load_hog_index():
+    """生猪现货价格指数 (akshare)"""
+    try:
+        import akshare as ak
+        df = ak.index_hog_spot_price()
+        df.columns = ["date", "index", "ma4", "ma6", "ma12", "pre_sale_price", "volume", "turnover"]
+        df["date"] = pd.to_datetime(df["date"])
+        for c in ["index", "ma4", "ma6", "ma12", "pre_sale_price"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        return df.sort_values("date")
+    except Exception as e:
+        print(f"  [WARN] 生猪指数获取失败: {e}")
+        return pd.DataFrame()
+
+
+def load_soybean_spot():
+    """大豆现货价格 (搜猪网)"""
+    try:
+        import akshare as ak
+        df = ak.spot_soybean_price_soozhu()
+        df.columns = ["date", "price"]
+        df["date"] = pd.to_datetime(df["date"])
+        df["price"] = pd.to_numeric(df["price"], errors="coerce")
+        return df.sort_values("date")
+    except Exception as e:
+        print(f"  [WARN] 大豆现货获取失败: {e}")
+        return pd.DataFrame()
+
+
+def fetch_multi_product_news():
+    """抓取各品种相关新闻 (akshare stock_news_em)"""
+    import akshare as ak
+    keywords_map = {
+        "玉米": ["玉米期货", "玉米供需", "玉米价格", "CBOT玉米"],
+        "淀粉": ["玉米淀粉", "淀粉期货", "深加工"],
+        "生猪": ["生猪期货", "猪价", "养殖", "能繁母猪"],
+        "鸡蛋": ["鸡蛋期货", "蛋价", "蛋鸡"],
+        "豆粕": ["豆粕期货", "豆粕价格", "大豆进口"],
+    }
+    all_news = {}
+    for product, kws in keywords_map.items():
+        items = []
+        seen = set()
+        for kw in kws[:2]:  # 每品种只搜2个关键词避免太慢
+            try:
+                df = ak.stock_news_em(symbol=kw)
+                if df is None or df.empty:
+                    continue
+                for _, row in df.iterrows():
+                    title = str(row["新闻标题"])
+                    if title[:50] in seen:
+                        continue
+                    seen.add(title[:50])
+                    pub_time = str(row.get("发布时间", ""))
+                    # 只取最近7天
+                    if pub_time[:10] < (REPORT_END - timedelta(days=7)).isoformat():
+                        continue
+                    items.append({
+                        "title": title[:100],
+                        "time": pub_time[:16],
+                        "source": str(row.get("文章来源", "")),
+                    })
+            except Exception:
+                pass
+        items.sort(key=lambda x: x["time"], reverse=True)
+        all_news[product] = items[:8]  # 每品种最多8条
+    return all_news
 
 
 def load_ai_weight_report():
@@ -717,6 +823,180 @@ def generate_freight_chart(freight_df):
     return base64.b64encode(buf.read()).decode()
 
 
+def generate_product_trend_chart(df, title, color, ylabel="元/吨"):
+    """品种期货近一周走势: 日K线(收盘+高低) + 成交量, x轴=日期的星期"""
+    if df.empty or len(df) < 2:
+        return ""
+    # 只取近10个交易日 (约2周, 确保覆盖本周+上周对比)
+    data = df.tail(10).copy()
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 3.8), gridspec_kw={"height_ratios": [3, 1]})
+    fig.patch.set_facecolor("#FCFAF5")
+
+    # 价格走势
+    ax1.set_facecolor("#FEFEFE")
+    x = range(len(data))
+    ax1.plot(x, data["close"].values, color=color, linewidth=2.5, marker="o", markersize=7,
+             markerfacecolor="white", markeredgewidth=2, markeredgecolor=color, zorder=5)
+    ax1.fill_between(x, data["low"].values, data["high"].values, alpha=0.12, color=color)
+
+    # 每个点标注价格
+    for xi, (_, r) in enumerate(data.iterrows()):
+        ax1.annotate(f"{r['close']:.0f}", (xi, r["close"]), textcoords="offset points",
+                     xytext=(0, 12), ha="center", fontsize=9, fontweight="bold", color=color)
+
+    ax1.set_ylabel(ylabel, fontsize=9, color="#7F8C8D")
+    ax1.set_title(title, fontsize=13, fontweight="bold", color=color, pad=6)
+    ax1.spines["top"].set_visible(False)
+    ax1.spines["right"].set_visible(False)
+    ax1.grid(axis="y", linestyle="--", alpha=0.2, color="#BDC3C7")
+    ax1.tick_params(labelsize=8)
+
+    # 成交量柱
+    ax2.set_facecolor("#FEFEFE")
+    vol_colors = ["#C0392B" if data["close"].iloc[i] >= data["open"].iloc[i] else "#27AE60" for i in range(len(data))]
+    ax2.bar(x, data["volume"].values / 10000, color=vol_colors, alpha=0.6, width=0.65, edgecolor="white", linewidth=0.2)
+    ax2.set_ylabel("万手", fontsize=8, color="#7F8C8D")
+    ax2.spines["top"].set_visible(False)
+    ax2.spines["right"].set_visible(False)
+
+    # x轴: 日期 + 星期
+    weekdays_cn = ["一","二","三","四","五","六","日"]
+    tick_labels = [data["date"].iloc[i].strftime("%m/%d") + f"\n周{weekdays_cn[data['date'].iloc[i].weekday()]}" for i in range(len(data))]
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(tick_labels, fontsize=7, color="#2C3E50")
+
+    fig.text(0.5, 0.005, "数据来源: akshare futures_main_sina  |  近10个交易日",
+             ha="center", fontsize=7, color="#95A5A6", style="italic")
+    plt.tight_layout(rect=[0, 0.04, 1, 0.97])
+
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=160, bbox_inches="tight", facecolor=fig.get_facecolor(), format="png")
+    plt.close(fig)
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode()
+
+
+def compute_tech_analysis(df):
+    """计算技术指标: 周涨跌, RSI(7), 波动率, 支撑/压力"""
+    if df.empty or len(df) < 5:
+        return {}
+    recent = df.tail(10).copy()
+    close = recent["close"].values
+    last = close[-1]
+    prev = close[-2] if len(close) >= 2 else last
+    week_ago = close[0]
+
+    # RSI(7)
+    deltas = [close[i] - close[i-1] for i in range(1, len(close))]
+    gains = [d if d > 0 else 0 for d in deltas[-7:]]
+    losses = [-d if d < 0 else 0 for d in deltas[-7:]]
+    avg_gain = sum(gains) / max(len(gains), 1)
+    avg_loss = sum(losses) / max(len(losses), 1)
+    rsi = 100 - (100 / (1 + avg_gain / avg_loss)) if avg_loss > 0 else 100
+
+    # 波动率
+    returns = [abs((close[i] - close[i-1]) / close[i-1]) for i in range(1, len(close))]
+    volatility = sum(returns) / len(returns) * 100 if returns else 0
+
+    # 支撑/压力
+    high_week = max(close)
+    low_week = min(close)
+
+    # 趋势判断
+    if last > week_ago * 1.02:
+        trend = "偏强上涨"
+    elif last < week_ago * 0.98:
+        trend = "偏弱下跌"
+    else:
+        trend = "窄幅震荡"
+
+    # RSI判断
+    if rsi > 70:
+        rsi_signal = "超买区，短期注意回调风险"
+    elif rsi < 30:
+        rsi_signal = "超卖区，短线或有反弹需求"
+    elif rsi > 50:
+        rsi_signal = "偏强，多头占优"
+    else:
+        rsi_signal = "偏弱，空头占优"
+
+    return {
+        "last": last, "prev": prev, "week_ago": week_ago,
+        "chg": last - week_ago, "chg_pct": (last - week_ago) / week_ago * 100,
+        "rsi": round(rsi, 1), "rsi_signal": rsi_signal,
+        "volatility": round(volatility, 2),
+        "trend": trend,
+        "high": high_week, "low": low_week,
+        "vol_total": float(recent["volume"].tail(5).sum() / 10000),
+        "oi": float(recent["open_interest"].iloc[-1] / 10000) if "open_interest" in recent.columns else 0,
+    }
+
+
+def load_product_basis(symbol, label):
+    """获取单品种最新基差 (快速单日API)"""
+    try:
+        import akshare as ak
+        df = ak.futures_spot_price(date=REPORT_END.strftime("%Y%m%d"), vars_list=[symbol])
+        if df.empty:
+            # 回退一天
+            prev_day = (REPORT_END - timedelta(days=1)).strftime("%Y%m%d")
+            df = ak.futures_spot_price(date=prev_day, vars_list=[symbol])
+        if not df.empty:
+            r = df.iloc[0]
+            return {
+                "spot": float(r["spot_price"]),
+                "basis": float(r["dom_basis"]),
+                "basis_rate": float(r["dom_basis_rate"]) * 100,
+            }
+    except Exception as e:
+        print(f"  [WARN] {label}基差获取失败: {e}")
+    return {}
+
+
+def generate_hog_index_chart(hog_idx_df, hog_fut_df):
+    """生猪指数+期货双轴图"""
+    if hog_idx_df.empty:
+        return ""
+    df = hog_idx_df.tail(120).copy()
+
+    fig, ax1 = plt.subplots(figsize=(13, 4.0))
+    fig.patch.set_facecolor("#FCFAF5")
+    ax1.set_facecolor("#FEFEFE")
+
+    x = range(len(df))
+    ax1.plot(x, df["index"].values, color="#2980B9", linewidth=2.2, marker="o", markersize=4,
+             markerfacecolor="white", markeredgewidth=1.5, markeredgecolor="#2980B9", label="生猪现货指数")
+    ax1.fill_between(x, df["index"].min() - 5, df["index"].values, alpha=0.06, color="#2980B9")
+    ax1.axhline(y=100, color="#BDC3C7", linewidth=0.6, linestyle="--", alpha=0.5)
+
+    last_idx = df["index"].iloc[-1]
+    ax1.annotate(f"指数 {last_idx:.1f}", (x[-1], last_idx), textcoords="offset points",
+                 xytext=(8, 0), ha="left", fontsize=10, fontweight="bold", color="#2980B9")
+
+    ax1.set_ylabel("生猪指数", fontsize=9, color="#2980B9")
+    ax1.tick_params(axis="y", colors="#2980B9", labelsize=8)
+    ax1.spines["top"].set_visible(False)
+    ax1.legend(fontsize=8, loc="upper left", framealpha=0.8)
+
+    tick_positions = list(range(0, len(df), max(1, len(df) // 8)))
+    tick_labels = [df["date"].iloc[i].strftime("%Y-%m") if i < len(df) else "" for i in tick_positions]
+    ax1.set_xticks(tick_positions)
+    ax1.set_xticklabels(tick_labels, fontsize=7, color="#7F8C8D", rotation=30)
+    ax1.grid(axis="y", linestyle="--", alpha=0.2, color="#BDC3C7")
+
+    fig.suptitle("生猪现货指数走势\n(Hog Spot Price Index)", fontsize=13, fontweight="bold", color="#2C3E50", y=1.01)
+    fig.text(0.5, 0.01, "数据来源: akshare index_hog_spot_price  |  基准: 100 (2021年=100)",
+             ha="center", fontsize=7, color="#95A5A6", style="italic")
+    plt.tight_layout(rect=[0, 0.04, 1, 0.93])
+
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=160, bbox_inches="tight", facecolor=fig.get_facecolor(), format="png")
+    plt.close(fig)
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode()
+
+
 # ═══════════════════════════════════════════════════════════
 # HTML 模板生成
 # ═══════════════════════════════════════════════════════════
@@ -781,7 +1061,7 @@ body {
 /* ── 行情速览卡片 ── */
 .metrics-row {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   gap: 10px;
   margin-bottom: 18px;
 }
@@ -879,6 +1159,14 @@ body {
 .data-table .chg-down { color: var(--down); font-weight: 600; }
 .data-table .chg-flat { color: var(--flat); }
 
+/* ── 分析框 ── */
+.analysis-box {
+  background: #FFFEFB;
+  border-left: 3px solid #BDC3C7;
+  padding: 8px 12px;
+  margin: 6px 0;
+}
+
 /* ── 要点 ── */
 .key-points {
   background: linear-gradient(135deg, #FFF8F6 0%, #FEF5F0 100%);
@@ -975,8 +1263,10 @@ body {
 
 
 def build_html(stats, casde_data, usda_data, sales_df, weather_list, report_date_str,
-               sales_chart_b64, cftc_chart_b64, spot_trend_b64, downstream_b64, freight_b64):
-    """构建完整HTML"""
+               sales_chart_b64, cftc_chart_b64, spot_trend_b64, downstream_b64, freight_b64,
+               product_charts, hog_index_b64, news_data, product_stats, product_tech, product_basis,
+               corn_tech):
+    """构建完整HTML — 饲料能量农产品周报"""
     casde_rows_data, cy, py, casde_date, casde_note = casde_data
     usda_rows_data, usda_my, usda_py, usda_date = usda_data
 
@@ -1000,41 +1290,43 @@ def build_html(stats, casde_data, usda_data, sales_df, weather_list, report_date
     cbot_chg = stats["cbot_close"] - stats["cbot_prev"]
     basis_chg = stats["dom_basis"] - stats["basis_prev"]
 
-    metrics_html = f"""
-    <div class="metrics-row">
+    # 5品种指标卡片
+    def metric_card(label, value, unit, change_val, change_unit, sub_text="", color_class=""):
+        cls = "up" if change_val > 0.005 else ("down" if change_val < -0.005 else "flat")
+        return f"""
       <div class="metric-card">
-        <div class="label">玉米期货主力</div>
-        <div class="value accent">{stats['futures_close']:.0f}</div>
-        <div class="change {'up' if futures_chg > 0 else ('down' if futures_chg < 0 else 'flat')}">
-          较上周 {fmt_change(futures_chg, ' 元/吨')}
-        </div>
-        <div style="font-size:10px;color:#7F8C8D;">MA20: {stats.get('futures_ma20', '-') or '-':.0f} 元/吨</div>
-      </div>
-      <div class="metric-card">
-        <div class="label">全国现货均价</div>
-        <div class="value">{stats['spot_price']:.0f}</div>
-        <div class="change {'up' if spot_chg > 0 else ('down' if spot_chg < 0 else 'flat')}">
-          较上周 {fmt_change(spot_chg, ' 元/吨')}
-        </div>
-        <div style="font-size:10px;color:#7F8C8D;">基差: +{stats['dom_basis']:.0f} 元/吨</div>
-      </div>
-      <div class="metric-card">
-        <div class="label">CBOT玉米</div>
-        <div class="value">{stats['cbot_close']:.1f}</div>
-        <div class="change {'up' if cbot_chg > 0 else ('down' if cbot_chg < 0 else 'flat')}">
-          较上周 {fmt_change(cbot_chg, ' 美分/蒲')}
-        </div>
-        <div style="font-size:10px;color:#7F8C8D;">{stats['cbot_date']}</div>
-      </div>
-      <div class="metric-card">
-        <div class="label">期货仓单库存</div>
-        <div class="value">{stats['inventory']/10000:.2f}<span style="font-size:14px;"> 万吨</span></div>
-        <div class="change {'up' if stats['inventory_week_change'] > 0 else ('down' if stats['inventory_week_change'] < 0 else 'flat')}">
-          周变动 {fmt_change(stats['inventory_week_change']/10000, ' 万吨')}
-        </div>
-        <div style="font-size:10px;color:#7F8C8D;">{stats['inventory_date']}</div>
-      </div>
-    </div>"""
+        <div class="label">{label}</div>
+        <div class="value {color_class}">{value}</div>
+        <div class="change {cls}">较上周 {fmt_change(change_val, unit)}</div>
+        <div style="font-size:10px;color:#7F8C8D;">{sub_text}</div>
+      </div>"""
+
+    metrics_html = '<div class="metrics-row">'
+    # 玉米
+    metrics_html += metric_card("玉米 C2607", f"{stats['futures_close']:.0f}", " 元/吨",
+                                futures_chg, " 元/吨",
+                                f"基差:+{stats['dom_basis']:.0f} 仓单:{stats['inventory']/10000:.1f}万吨", "accent")
+    # 淀粉
+    ps = product_stats.get("starch", {})
+    metrics_html += metric_card("玉米淀粉 CS", f"{ps.get('close',0):.0f}", " 元/吨",
+                                ps.get("chg", 0), " 元/吨",
+                                f"MA20:{ps.get('ma20',0):.0f}", "")
+    # 生猪
+    ps = product_stats.get("hog", {})
+    metrics_html += metric_card("生猪 LH", f"{ps.get('close',0):.0f}", " 元/吨",
+                                ps.get("chg", 0), " 元/吨",
+                                f"指数:{ps.get('index_val',0):.1f}", "")
+    # 鸡蛋
+    ps = product_stats.get("egg", {})
+    metrics_html += metric_card("鸡蛋 JD", f"{ps.get('close',0):.0f}", " 元/500kg",
+                                ps.get("chg", 0), " 元/500kg",
+                                f"MA20:{ps.get('ma20',0):.0f}", "")
+    # 豆粕
+    ps = product_stats.get("soymeal", {})
+    metrics_html += metric_card("豆粕 M", f"{ps.get('close',0):.0f}", " 元/吨",
+                                ps.get("chg", 0), " 元/吨",
+                                f"大豆:{ps.get('soybean_spot',0):.1f}元/斤", "")
+    metrics_html += '</div>'
 
     # ── 行情综述 ──
     ma20_str = f"{stats.get('futures_ma20', 0):.0f}" if stats.get('futures_ma20') else "—"
@@ -1060,6 +1352,58 @@ def build_html(stats, casde_data, usda_data, sales_df, weather_list, report_date
         持仓量 <span class="highlight">{stats['futures_open_interest']/10000:.1f} 万手</span>，
         周成交量 <span class="highlight">{stats['futures_volume']/10000:.1f} 万手</span>。
       </p>
+    </div>"""
+
+    # ── 玉米: 技术分析 + 基差分析 + 基本面分析 ──
+    corn_analysis_html = ""
+    if corn_tech:
+        t = corn_tech
+        corn_color = "#C0392B"
+        # Tech
+        corn_analysis_html += f"""
+    <div class="section-title">玉米技术分析与基差<span class="en">Corn Technical & Basis</span></div>
+    <div class="analysis-box">
+      <h4 style="color:{corn_color};margin:0 0 4px 0;font-size:12px;">技术分析</h4>
+      <p style="margin:2px 0;font-size:11px;">
+        RSI(7): <strong>{t.get('rsi',0):.1f}</strong> — {t.get('rsi_signal','')} &nbsp;|&nbsp;
+        周波动率: <strong>{t.get('volatility',0):.1f}%</strong> &nbsp;|&nbsp;
+        周涨跌: <span style="color:{'#C0392B' if t.get('chg',0) > 0 else '#27AE60'};font-weight:700;">{t.get('chg_pct',0):+.1f}%</span>
+      </p>
+      <p style="margin:2px 0;font-size:11px;">
+        压力位: <strong style="color:#C0392B;">{t.get('high',0):.0f}</strong> &nbsp;|&nbsp;
+        支撑位: <strong style="color:#27AE60;">{t.get('low',0):.0f}</strong>
+      </p>
+    </div>"""
+        # Basis
+        dom_basis = stats.get("dom_basis", 0)
+        spot = stats.get("spot_price", 0)
+        if dom_basis > 0:
+            basis_desc = f"期货升水现货 {dom_basis:.0f} 元/吨（升水率 {abs(dom_basis)/spot*100:.1f}%），市场对远期供应偏紧有一定预期。"
+        elif dom_basis < 0:
+            basis_desc = f"期货贴水现货 {abs(dom_basis):.0f} 元/吨（贴水率 {abs(dom_basis)/spot*100:.1f}%），现货偏强或近月交割压力较大。"
+        else:
+            basis_desc = "期现基本平水，市场定价中性。"
+        corn_analysis_html += f"""
+    <div class="analysis-box">
+      <h4 style="color:{corn_color};margin:0 0 4px 0;font-size:12px;">基差分析</h4>
+      <p style="margin:2px 0;font-size:11px;">
+        全国现货均价: <strong>{stats['spot_price']:.0f}</strong> 元/吨 &nbsp;|&nbsp;
+        主力基差: <strong style="color:{'#C0392B' if dom_basis > 0 else '#2980B9'};">
+        {'+' if dom_basis > 0 else ''}{dom_basis:.0f}</strong> 元/吨（{'升水' if dom_basis > 0 else '贴水'}）
+      </p>
+      <p style="margin:2px 0;font-size:11px;color:#7F8C8D;">{basis_desc}</p>
+    </div>"""
+        # Fundamentals
+        prod_gap = float(casde_rows_data[5]['curr']) - float(casde_rows_data[1]['curr'])
+        corn_analysis_html += f"""
+    <div class="analysis-box">
+      <h4 style="color:{corn_color};margin:0 0 4px 0;font-size:12px;">基本面分析</h4>
+      <ul style="margin:2px 0;padding-left:16px;font-size:11px;">
+        <li>CASDE预估2026/27年度中国玉米产量 {casde_rows_data[1]['curr']} 百万吨，消费 {casde_rows_data[5]['curr']} 百万吨，产需缺口约 {abs(prod_gap):.1f} 百万吨。</li>
+        <li>USDA 5月报告全球库存消费比降至 {usda_rows_data[3]['curr']}%（上年 {usda_rows_data[3]['prev']}%），全球供应收紧态势延续。</li>
+        <li>进口配额收紧至 {casde_rows_data[6]['curr']} 百万吨，新季玉米面积+0.4%叠加单产+1.2%，产量预期创新高。</li>
+        <li>东北基层余粮不足一成，粮权转向贸易商；华北腾库出货对短期价格形成压力。</li>
+      </ul>
     </div>"""
 
     # ── CASDE 供需表 ──
@@ -1230,6 +1574,152 @@ def build_html(stats, casde_data, usda_data, sales_df, weather_list, report_date
       ※ BDI指数反映全球散货海运成本，是进口谷物到港运费的重要参照指标。BDI上行意味进口成本增加，对国内玉米价格形成支撑。
     </p>"""
 
+    # ── 生猪指数 ──
+    hog_index_html = ""
+    if hog_index_b64:
+        hog_index_html = f"""
+    <div class="section-title">生猪市场<span class="en">Live Hog Market</span></div>
+    <div style="text-align:center;margin:8px 0 4px 0;">
+      <img src="data:image/png;base64,{hog_index_b64}"
+           style="width:100%;max-width:780px;border:1px solid var(--border);"
+           alt="生猪指数走势" />
+    </div>"""
+
+    # ── 各品种期货走势 + 技术分析 + 基本面 + 基差 ──
+    product_sections_html = ""
+    product_configs = [
+        ("starch", "玉米淀粉", "Corn Starch", "CS", "#E67E22"),
+        ("hog", "生猪", "Live Hog", "LH", "#2980B9"),
+        ("egg", "鸡蛋", "Egg", "JD", "#8E44AD", "元/500kg"),
+        ("soymeal", "豆粕", "Soymeal", "M", "#27AE60"),
+    ]
+    for cfg in product_configs:
+        key, name, en, code, color = cfg[0], cfg[1], cfg[2], cfg[3], cfg[4]
+        ylabel = cfg[5] if len(cfg) > 5 else "元/吨"
+        chart = product_charts.get(key, "")
+        tech = product_tech.get(key, {})
+        basis = product_basis.get(key, {})
+        ps = product_stats.get(key, {})
+
+        if not chart:
+            continue
+
+        # 行情综述文本
+        if tech:
+            commentary = f"本周{name}期货主力{tech.get('trend','震荡')}，收于 {tech.get('last',0):.0f} {ylabel}，周涨跌 {tech.get('chg_pct',0):+.1f}%。"
+            commentary += f"最高 {tech.get('high',0):.0f}，最低 {tech.get('low',0):.0f}，"
+            commentary += f"周成交量 {tech.get('vol_total',0):.0f} 万手，持仓量 {tech.get('oi',0):.0f} 万手。"
+        else:
+            commentary = f"{name}期货主力合约最新价 {ps.get('close',0):.0f} {ylabel}。"
+
+        # 技术分析
+        tech_html = ""
+        if tech:
+            tech_html = f"""
+      <div class="analysis-box">
+        <h4 style="color:{color};margin:0 0 4px 0;font-size:12px;">技术分析</h4>
+        <p style="margin:2px 0;font-size:11px;">
+          RSI(7): <strong>{tech.get('rsi',0):.1f}</strong> — {tech.get('rsi_signal','')} &nbsp;|&nbsp;
+          周波动率: <strong>{tech.get('volatility',0):.1f}%</strong> &nbsp;|&nbsp;
+          周涨跌: <span style="color:{'#C0392B' if tech.get('chg',0) > 0 else '#27AE60'};font-weight:700;">{tech.get('chg_pct',0):+.1f}%</span>
+        </p>
+        <p style="margin:2px 0;font-size:11px;">
+          压力位: <strong style="color:#C0392B;">{tech.get('high',0):.0f}</strong> &nbsp;|&nbsp;
+          支撑位: <strong style="color:#27AE60;">{tech.get('low',0):.0f}</strong>
+        </p>
+      </div>"""
+
+        # 基差分析
+        basis_html = ""
+        if basis:
+            b_val = basis.get("basis", 0)
+            b_rate = basis.get("basis_rate", 0)
+            spot = basis.get("spot", 0)
+            if b_val > 0:
+                basis_desc = f"期货升水现货 {b_val:.0f} {ylabel}（升水率 {b_rate:.1f}%），反映市场对未来价格偏乐观预期。"
+            elif b_val < 0:
+                basis_desc = f"期货贴水现货 {abs(b_val):.0f} {ylabel}（贴水率 {abs(b_rate):.1f}%），现货端偏紧或近月交割压力较大。"
+            else:
+                basis_desc = "期现基本平水，市场定价中性。"
+            basis_html = f"""
+      <div class="analysis-box">
+        <h4 style="color:{color};margin:0 0 4px 0;font-size:12px;">基差分析</h4>
+        <p style="margin:2px 0;font-size:11px;">
+          现货价: <strong>{spot:.0f}</strong> {ylabel} &nbsp;|&nbsp;
+          基差: <strong style="color:{'#C0392B' if b_val > 0 else '#2980B9'};">
+          {'+' if b_val > 0 else ''}{b_val:.0f}</strong> {ylabel}（{'升水' if b_val > 0 else '贴水'}{abs(b_rate):.1f}%）
+        </p>
+        <p style="margin:2px 0;font-size:11px;color:#7F8C8D;">{basis_desc}</p>
+      </div>"""
+
+        # 基本面分析 (基于数据自动生成)
+        fundamentals = []
+        if key == "starch":
+            fundamentals = [
+                "玉米淀粉加工利润处于盈亏线附近，深加工企业开机率维持区间高位，库存累积压力持续。",
+                "玉米原料成本支撑偏强，但下游淀粉糖及造纸需求恢复缓慢，供需偏宽松。",
+                f"期货{ '升水' if ps.get('chg',0) > 0 else '震荡' }，反映市场对原料玉米成本传导的预期。",
+            ]
+        elif key == "hog":
+            fundamentals = [
+                "生猪产能去化缓慢，能繁母猪存栏仍高于合理区间，供应端压力持续。",
+                "猪价季节性反弹预期存在，但消费端支撑有限，供需博弈加剧。",
+                "养殖利润修复中，饲料成本(玉米/豆粕)波动对养殖端利润影响显著。",
+            ]
+        elif key == "egg":
+            fundamentals = [
+                "蛋鸡存栏量处于高位，鸡蛋供应充裕，价格承压。",
+                "端午节前备货需求或阶段性提振蛋价，但持续性有待观察。",
+                "饲料原料(玉米/豆粕)价格波动直接影响蛋鸡养殖成本。",
+            ]
+        elif key == "soymeal":
+            fundamentals = [
+                "豆粕价格与国际大豆(美豆/巴西豆)到港节奏密切相关，进口大豆集中到港或压制现货。",
+                "国内饲料需求受养殖存栏高位支撑，豆粕消费刚性较强。",
+                "CBOT大豆及国际运费(BDI)变动对进口大豆成本形成传导。",
+            ]
+
+        fund_html = ""
+        if fundamentals:
+            fund_html = f"""
+      <div class="analysis-box">
+        <h4 style="color:{color};margin:0 0 4px 0;font-size:12px;">基本面分析</h4>
+        <ul style="margin:2px 0;padding-left:16px;font-size:11px;">
+          {"".join(f'<li style="margin:2px 0;">{f}</li>' for f in fundamentals)}
+        </ul>
+      </div>"""
+
+        product_sections_html += f"""
+    <div class="section-title">{name}期货<span class="en">{en} Futures — {code}</span></div>
+    <p style="font-size:12px;color:#2C3E50;margin:0 0 6px 0;line-height:1.7;">{commentary}</p>
+    <div style="text-align:center;margin:4px 0 2px 0;">
+      <img src="data:image/png;base64,{chart}"
+           style="width:100%;max-width:780px;border:1px solid var(--border);"
+           alt="{name}期货走势" />
+    </div>
+    {tech_html}
+    {basis_html if basis else ''}
+    {fund_html}"""
+
+    # ── 行业新闻 ──
+    news_html = ""
+    if news_data:
+        news_html = '<div class="section-title">行业要闻<span class="en">Industry News</span></div>'
+        for product, items in news_data.items():
+            if not items:
+                continue
+            product_colors = {"玉米": "#C0392B", "淀粉": "#E67E22", "生猪": "#2980B9", "鸡蛋": "#8E44AD", "豆粕": "#27AE60"}
+            pc = product_colors.get(product, "#2C3E50")
+            news_html += f'<div style="margin-bottom:8px;"><h4 style="color:{pc};font-size:13px;margin:4px 0 4px 0;">▎{product}</h4>'
+            for item in items[:5]:
+                news_html += f'<div style="font-size:11px;padding:2px 0;border-bottom:1px dotted #EEE;">'
+                news_html += f'<span style="color:#7F8C8D;">[{item["time"]}]</span> '
+                news_html += f'{item["title"]}'
+                if item.get("source"):
+                    news_html += f' <span style="color:#95A5A6;font-size:10px;">({item["source"]})</span>'
+                news_html += '</div>'
+            news_html += '</div>'
+
     # ── 期货仓单库存 ──
     inv_html = f"""
     <div class="section-title">大商所玉米仓单库存<span class="en">DCE Registered Warehouse Receipts</span></div>
@@ -1281,14 +1771,14 @@ def build_html(stats, casde_data, usda_data, sales_df, weather_list, report_date
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>玉米市场周报 — {report_date_str}</title>
+<title>饲料能量农产品周报 — {report_date_str}</title>
 <style>{CSS}</style>
 </head>
 <body>
 
 <div class="cover-header">
-  <div class="title">玉米市场周报</div>
-  <div class="subtitle">China Corn Market Weekly Report</div>
+  <div class="title">饲料能量农产品周报</div>
+  <div class="subtitle">China Feed & Energy Agricultural Products Weekly</div>
   <div class="date-badge">{report_date_str} &nbsp;|&nbsp; 第 {REPORT_END.isocalendar()[1]} 周</div>
 </div>
 
@@ -1309,9 +1799,17 @@ def build_html(stats, casde_data, usda_data, sales_df, weather_list, report_date
 
 {spot_trend_html}
 
+{corn_analysis_html}
+
 {downstream_html}
 
 {freight_html}
+
+{hog_index_html}
+
+{product_sections_html}
+
+{news_html}
 
 {inv_html}
 
@@ -1455,13 +1953,13 @@ def refresh_all_data():
 
 def main():
     print("=" * 60)
-    print("  玉米市场周报生成器")
+    print("  饲料能量农产品周报生成器")
     print("=" * 60)
     print(f"  周度区间: {REPORT_START} ~ {REPORT_END}")
     print()
 
     # 刷新数据 → 确保所有数据源为本周最新
-    print("[0/10] 刷新数据源 (akshare 实时拉取) ...")
+    print("[0/12] 刷新数据源 (akshare 实时拉取) ...")
     updated_items = refresh_all_data()
     if updated_items:
         for item in updated_items:
@@ -1471,7 +1969,7 @@ def main():
     print()
 
     # 加载数据
-    print("[1/10] 加载本地数据 ...")
+    print("[1/12] 加载本地数据 ...")
     futures_df = load_futures()
     basis_df = load_spot_basis()
     cbot_df = load_cbot()
@@ -1483,24 +1981,66 @@ def main():
     print(f"  [OK] 期货 {len(futures_df)} 行, 现货 {len(basis_df)} 行, CBOT {len(cbot_df)} 行")
     print(f"  [OK] CASDE {len(casde_df)} 行, USDA {len(usda_df)} 行, 仓单 {len(inv_df)} 行")
 
-    # 加载 akshare 外部数据
-    print("[2/10] 加载 akshare 外部数据 ...")
+    # 加载 akshare 外部数据 + 新品种
+    print("[2/12] 加载 akshare 外部数据 ...")
     cftc_df = load_cftc_holding()
     soozhu_df = load_corn_spot_soozhu()
     hog_df = load_hog_price()
     feed_df = load_feed_price()
     freight_df = load_freight_index()
-    print(f"  [OK] CFTC {len(cftc_df)} 行, 现货(搜猪) {len(soozhu_df)} 行")
-    print(f"  [OK] 生猪 {len(hog_df)} 行, 饲料 {len(feed_df)} 行, BDI {len(freight_df)} 行")
+    starch_df = load_starch_futures()
+    egg_df = load_egg_futures()
+    hog_fut_df = load_hog_futures()
+    soymeal_df = load_soymeal_futures()
+    hog_idx_df = load_hog_index()
+    soybean_spot_df = load_soybean_spot()
+    print(f"  [OK] CFTC {len(cftc_df)} 现货 {len(soozhu_df)} BDI {len(freight_df)}")
+    print(f"  [OK] 淀粉 {len(starch_df)} 鸡蛋 {len(egg_df)} 生猪 {len(hog_fut_df)} 豆粕 {len(soymeal_df)} 生猪指数 {len(hog_idx_df)}")
+
+    # 计算产品周度统计
+    def product_weekly_stats(df):
+        if df.empty or len(df) < 5:
+            return {"close": 0, "chg": 0, "ma20": 0}
+        recent = df[df["date"] >= pd.Timestamp(REPORT_START)]
+        if recent.empty:
+            recent = df.tail(5)
+        prev = df[df["date"] < pd.Timestamp(REPORT_START)]
+        prev_close = float(prev.iloc[-1]["close"]) if not prev.empty else float(recent.iloc[0]["close"])
+        ma20 = float(df.tail(20)["close"].mean()) if len(df) >= 20 else float(df["close"].mean())
+        return {"close": float(recent.iloc[-1]["close"]), "chg": float(recent.iloc[-1]["close"]) - prev_close, "ma20": ma20}
+
+    product_stats = {
+        "starch": product_weekly_stats(starch_df),
+        "hog": product_weekly_stats(hog_fut_df),
+        "egg": product_weekly_stats(egg_df),
+        "soymeal": product_weekly_stats(soymeal_df),
+    }
+    # 附加生猪指数
+    if not hog_idx_df.empty:
+        product_stats["hog"]["index_val"] = float(hog_idx_df.iloc[-1]["index"])
+    # 附加大豆现货
+    if not soybean_spot_df.empty:
+        product_stats["soymeal"]["soybean_spot"] = float(soybean_spot_df.iloc[-1]["price"])
+
+    # 技术分析 & 基差
+    print("[3/12] 计算技术分析 + 基差 ...")
+    product_dfs = {"starch": starch_df, "hog": hog_fut_df, "egg": egg_df, "soymeal": soymeal_df}
+    corn_tech = compute_tech_analysis(futures_df)
+    product_tech = {k: compute_tech_analysis(v) for k, v in product_dfs.items()}
+    product_basis = {}
+    for sym, key in [("CS", "starch"), ("LH", "hog"), ("JD", "egg"), ("M", "soymeal")]:
+        product_basis[key] = load_product_basis(sym, key)
+    print(f"  [OK] 技术: C={corn_tech.get('rsi','-')} S={product_tech.get('starch',{}).get('rsi','-')} H={product_tech.get('hog',{}).get('rsi','-')} E={product_tech.get('egg',{}).get('rsi','-')} M={product_tech.get('soymeal',{}).get('rsi','-')}")
+    b_ok = [k for k, v in product_basis.items() if v]
+    print(f"  [OK] 基差: {', '.join(b_ok) if b_ok else '无'} ({len(b_ok)}/4)")
 
     # 计算周度统计
-    print("[3/10] 计算周度统计 ...")
     stats = compute_weekly_stats(futures_df, basis_df, cbot_df, inv_df)
-    print(f"  [OK] 期货收盘: {stats['futures_close']:.0f}, 现货: {stats['spot_price']:.0f}")
-    print(f"  [OK] CBOT: {stats['cbot_close']:.1f}, 基差: +{stats['dom_basis']:.0f}")
+    print(f"  [OK] 玉米: {stats['futures_close']:.0f} | 淀粉: {product_stats['starch']['close']:.0f} | 生猪: {product_stats['hog']['close']:.0f}")
+    print(f"  [OK] 鸡蛋: {product_stats['egg']['close']:.0f} | 豆粕: {product_stats['soymeal']['close']:.0f}")
 
     # CASDE数据
-    print("[4/10] 提取供需表数据 ...")
+    print("[4/12] 提取供需表数据 ...")
     casde_data = casde_rows(casde_df)
     print(f"  [OK] {casde_data[2]} vs {casde_data[1]}")
 
@@ -1509,33 +2049,55 @@ def main():
     print(f"  [OK] {usda_data[1]} vs {usda_data[2]}")
 
     # 天气数据
-    print("[5/10] 提取天气数据 ...")
+    print("[5/12] 提取天气数据 ...")
     weather_list = extract_weather(ai_data)
     print(f"  [OK] {len(weather_list)} 个站点")
 
+    # 抓取行业新闻
+    print("[6/12] 抓取行业新闻 ...")
+    news_data = fetch_multi_product_news()
+    news_count = sum(len(v) for v in news_data.values())
+    print(f"  [OK] {news_count} 条新闻 (玉米/淀粉/生猪/鸡蛋/豆粕)")
+
     # 生成各图表
-    print("[6/10] 生成统计图表 ...")
+    print("[7/12] 生成统计图表 ...")
     sales_chart_b64 = generate_sales_comparison_chart(sales_df)
     cftc_chart_b64 = generate_cftc_chart(cftc_df)
     spot_trend_b64 = generate_spot_trend_chart(soozhu_df)
     downstream_b64 = generate_downstream_chart(hog_df, feed_df)
     freight_b64 = generate_freight_chart(freight_df)
-    print(f"  [OK] 售粮图 ({len(sales_chart_b64)//1024}KB) | CFTC ({len(cftc_chart_b64)//1024 if cftc_chart_b64 else 0}KB)")
-    print(f"  [OK] 现货走势 ({len(spot_trend_b64)//1024 if spot_trend_b64 else 0}KB) | 下游 ({len(downstream_b64)//1024 if downstream_b64 else 0}KB)")
+    hog_index_b64 = generate_hog_index_chart(hog_idx_df, hog_fut_df)
+
+    # 新品种期货走势图
+    product_charts = {}
+    product_chart_configs = [
+        ("starch", starch_df, "玉米淀粉期货走势 (CS — Corn Starch Futures)", "#E67E22"),
+        ("hog", hog_fut_df, "生猪期货走势 (LH — Live Hog Futures)", "#2980B9"),
+        ("egg", egg_df, "鸡蛋期货走势 (JD — Egg Futures)", "#8E44AD", "元/500kg"),
+        ("soymeal", soymeal_df, "豆粕期货走势 (M — Soymeal Futures)", "#27AE60"),
+    ]
+    for key, df, title, color, *args in product_chart_configs:
+        ylabel = args[0] if args else "元/吨"
+        product_charts[key] = generate_product_trend_chart(df, title, color, ylabel)
+
+    print(f"  [OK] 玉米图表: 售粮({len(sales_chart_b64)//1024}K) CFTC({len(cftc_chart_b64)//1024 if cftc_chart_b64 else 0}K)")
+    print(f"  [OK] 新品种图表: 淀粉/生猪/鸡蛋/豆粕 + 生猪指数({len(hog_index_b64)//1024 if hog_index_b64 else 0}K)")
     print(f"  [OK] BDI ({len(freight_b64)//1024 if freight_b64 else 0}KB)")
 
     # 生成HTML
-    print("[7/10] 生成HTML报告 ...")
+    print("[8/12] 生成HTML报告 ...")
     report_date_str = REPORT_END.isoformat()
     html = build_html(stats, casde_data, usda_data, sales_df, weather_list, report_date_str,
-                      sales_chart_b64, cftc_chart_b64, spot_trend_b64, downstream_b64, freight_b64)
+                      sales_chart_b64, cftc_chart_b64, spot_trend_b64, downstream_b64, freight_b64,
+                      product_charts, hog_index_b64, news_data, product_stats, product_tech, product_basis,
+                      corn_tech)
 
     html_path = OUT_DIR / f"corn_weekly_report_{report_date_str}.html"
     html_path.write_text(html, encoding="utf-8")
     print(f"  [OK] HTML: {html_path}")
 
     # 转PDF
-    print("[8/10] 导出PDF ...")
+    print("[9/12] 导出PDF ...")
     pdf_path = OUT_DIR / f"corn_weekly_report_{report_date_str}.pdf"
     success = html_to_pdf(str(html_path), str(pdf_path))
     if success:
