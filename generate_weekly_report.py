@@ -236,9 +236,48 @@ def load_soybean_spot():
         return pd.DataFrame()
 
 
+def load_hog_fundamentals():
+    """加载生猪供需基本面 CSV"""
+    path = ML_DIR / "hog_fundamentals.csv"
+    if not path.exists():
+        return {}
+    try:
+        df = pd.read_csv(path, dtype={"date": str})
+        if df.empty:
+            return {}
+        latest = df.iloc[-1].to_dict()
+        return latest
+    except Exception:
+        return {}
+
+
+def load_egg_fundamentals():
+    """加载鸡蛋供需基本面 CSV"""
+    path = ML_DIR / "egg_fundamentals.csv"
+    if not path.exists():
+        return {}
+    try:
+        df = pd.read_csv(path, dtype={"date": str})
+        if df.empty:
+            return {}
+        latest = df.iloc[-1].to_dict()
+        return latest
+    except Exception:
+        return {}
+
+
 def fetch_multi_product_news():
     """抓取各品种相关新闻 (akshare stock_news_em)"""
     import akshare as ak
+
+    EXCLUDE_KW = [
+        "玻璃", "纯碱", "螺纹钢", "铁矿石", "热卷", "PVC", "PTA", "甲醇", "LPG",
+        "原油", "石油", "黄金", "白银", "铜", "铝", "锌", "锡", "镍", "锂", "钴",
+        "碳酸锂", "工业硅", "橡胶", "轮胎", "芯片", "半导体", "新能源车", "光伏",
+        "医药", "地产", "楼市", "人民币汇率", "央行", "MLF", "LPR", "降息", "降准",
+        "A股", "上证", "深证", "创业板", "沙特", "中东", "俄乌", "制造业PMI",
+    ]
+
     keywords_map = {
         "玉米": ["玉米期货", "玉米供需", "玉米价格", "CBOT玉米"],
         "淀粉": ["玉米淀粉", "淀粉期货", "深加工"],
@@ -259,15 +298,20 @@ def fetch_multi_product_news():
                     title = str(row["新闻标题"])
                     if title[:50] in seen:
                         continue
+                    # 排除与农产品无关的新闻
+                    if any(kw in title for kw in EXCLUDE_KW):
+                        continue
                     seen.add(title[:50])
                     pub_time = str(row.get("发布时间", ""))
                     # 只取最近7天
                     if pub_time[:10] < (REPORT_END - timedelta(days=7)).isoformat():
                         continue
+                    url = str(row.get("新闻链接", ""))
                     items.append({
                         "title": title[:100],
                         "time": pub_time[:16],
                         "source": str(row.get("文章来源", "")),
+                        "url": url if url and url != "nan" else "",
                     })
             except Exception:
                 pass
@@ -1265,7 +1309,7 @@ body {
 def build_html(stats, casde_data, usda_data, sales_df, weather_list, report_date_str,
                sales_chart_b64, cftc_chart_b64, spot_trend_b64, downstream_b64, freight_b64,
                product_charts, hog_index_b64, news_data, product_stats, product_tech, product_basis,
-               corn_tech):
+               corn_tech, hog_fundamentals=None, egg_fundamentals=None):
     """构建完整HTML — 饲料能量农产品周报"""
     casde_rows_data, cy, py, casde_date, casde_note = casde_data
     usda_rows_data, usda_my, usda_py, usda_date = usda_data
@@ -1330,6 +1374,32 @@ def build_html(stats, casde_data, usda_data, sales_df, weather_list, report_date
 
     # ── 行情综述 ──
     ma20_str = f"{stats.get('futures_ma20', 0):.0f}" if stats.get('futures_ma20') else "—"
+
+    # 各品种行情描述
+    product_descriptions = []
+    product_config = [
+        ("starch", "玉米淀粉", "CS", "元/吨"),
+        ("hog", "生猪", "LH", "元/吨"),
+        ("egg", "鸡蛋", "JD", "元/500kg"),
+        ("soymeal", "豆粕", "M", "元/吨"),
+    ]
+    for key, name, code, unit in product_config:
+        ps = product_stats.get(key, {})
+        pt = product_tech.get(key, {})
+        if not ps.get("close"):
+            continue
+        chg = ps.get("chg", 0)
+        if pt:
+            trend = pt.get("trend", "震荡")
+            desc = f"{name}({code}){trend}，收于 {ps['close']:.0f} {unit}，周涨跌 {chg:+.1f} {unit}（{chg/(ps['close']-chg)*100:.1f}%），最高 {pt.get('high',0):.0f}，最低 {pt.get('low',0):.0f}，持仓 {pt.get('oi',0):.0f} 万手。"
+        else:
+            desc = f"{name}({code})收于 {ps['close']:.0f} {unit}，周涨跌 {chg:+.1f} {unit}。"
+        product_descriptions.append(desc)
+
+    products_overview = ""
+    for d in product_descriptions:
+        products_overview += f"        <li>{d}</li>\n"
+
     market_html = f"""
     <div class="market-summary">
       <p>
@@ -1352,6 +1422,12 @@ def build_html(stats, casde_data, usda_data, sales_df, weather_list, report_date
         持仓量 <span class="highlight">{stats['futures_open_interest']/10000:.1f} 万手</span>，
         周成交量 <span class="highlight">{stats['futures_volume']/10000:.1f} 万手</span>。
       </p>
+      <p style="font-size:12px;color:#2C3E50;margin-top:8px;line-height:1.7;">
+        <strong>相关品种：</strong>
+      </p>
+      <ul style="font-size:12px;color:#2C3E50;margin:0;padding-left:18px;line-height:1.8;">
+{products_overview}
+      </ul>
     </div>"""
 
     # ── 玉米: 技术分析 + 基差分析 + 基本面分析 ──
@@ -1451,6 +1527,129 @@ def build_html(stats, casde_data, usda_data, sales_df, weather_list, report_date
     <table class="data-table">
       <thead><tr><th style="width:35%">指标</th><th>{usda_py}</th><th>{usda_my}</th><th>同比变化</th></tr></thead>
       <tbody>{usda_tbody}</tbody>
+    </table>"""
+
+    # ── 品种供需基本面 ──
+    product_sd_html = ""
+
+    # --- 玉米淀粉 (技术面为主) ---
+    ps = product_stats.get("starch", {})
+    pt = product_tech.get("starch", {})
+    pb = product_basis.get("starch", {})
+    if ps.get("close"):
+        rows = [
+            ("期货收盘", f"{ps.get('close',0):.0f} 元/吨"),
+            ("周涨跌", f"{ps.get('chg',0):+.0f} 元/吨"),
+            ("MA20均线", f"{ps.get('ma20',0):.0f} 元/吨"),
+            ("RSI(7)", f"{pt.get('rsi',0):.1f} — {pt.get('rsi_signal','')}"),
+            ("成交量", f"{pt.get('vol_total',0):.0f} 万手"),
+            ("持仓量", f"{pt.get('oi',0):.0f} 万手"),
+            ("基差", f"{pb.get('basis',0):+.0f} 元/吨 ({'升水' if pb.get('basis',0)>0 else '贴水'}{abs(pb.get('basis_rate',0)):.1f}%)" if pb else "—"),
+            ("供需格局", "原料成本支撑偏强，下游需求恢复缓慢，供需偏宽松"),
+        ]
+        tbody = "".join(f"<tr><td class=\"row-name\">{r[0]}</td><td>{r[1]}</td></tr>" for r in rows)
+        product_sd_html += f"""
+    <div class="section-title" style="margin-top:4px;">玉米淀粉供需基本面<span class="en">Corn Starch Fundamentals — CS</span></div>
+    <table class="data-table" style="max-width:500px;">
+      <thead><tr><th style="width:30%">指标</th><th>当前值</th></tr></thead>
+      <tbody>{tbody}</tbody>
+    </table>"""
+
+    # --- 生猪 (使用 akshare 实时数据) ---
+    hf = hog_fundamentals or {}
+    ps = product_stats.get("hog", {})
+    pt = product_tech.get("hog", {})
+    pb = product_basis.get("hog", {})
+    if ps.get("close"):
+        hog_rows = [
+            ("期货收盘", f"{ps.get('close',0):.0f} 元/吨"),
+            ("周涨跌", f"{ps.get('chg',0):+.0f} 元/吨"),
+            ("全国均价", f"{hf.get('hog_price_kg','—')} 元/公斤" + (f" ({hf.get('hog_price_date','')})" if hf.get('hog_price_date') else "")),
+            ("猪粮比", hf.get('hog_core', '—')),
+            ("头均成本", f"{hf.get('hog_cost','—')} 元/头" if hf.get('hog_cost') else "—"),
+            ("供给指标", hf.get('hog_supply', '—')),
+            ("基差", f"{hf.get('hog_futures_basis',pb.get('basis',0)):+.0f} 元/吨" if hf.get('hog_futures_basis') or pb else "—"),
+            ("玉米/豆粕/饲料", f"{hf.get('corn_price_kg','—')}/{hf.get('soybean_price_kg','—')}/{hf.get('feed_price_kg','—')} 元/kg"),
+        ]
+        # 供需格局判断
+        hog_core = float(hf.get('hog_core', 0) or 0)
+        if hog_core > 10:
+            hog_trend = "猪粮比高位，养殖利润较好，产能去化缓慢，供应偏宽松"
+        elif hog_core > 7:
+            hog_trend = "猪粮比适中，养殖基本盈亏平衡，供需博弈"
+        else:
+            hog_trend = "猪粮比偏低，养殖亏损或倒逼产能去化，供应有望收紧"
+        hog_rows.append(("供需格局", hog_trend))
+
+        tbody = "".join(f"<tr><td class=\"row-name\">{r[0]}</td><td>{r[1]}</td></tr>" for r in hog_rows)
+        product_sd_html += f"""
+    <div class="section-title" style="margin-top:4px;">生猪供需基本面<span class="en">Live Hog Fundamentals — LH</span></div>
+    <p style="font-size:10px;color:var(--muted);margin:0 0 4px 0;">
+      数据来源: 搜猪网(soozhu) + 大商所 &nbsp;|&nbsp; 猪粮比=生猪价/玉米价，5.5-6.0为盈亏平衡线
+    </p>
+    <table class="data-table" style="max-width:500px;">
+      <thead><tr><th style="width:30%">指标</th><th>当前值</th></tr></thead>
+      <tbody>{tbody}</tbody>
+    </table>"""
+
+    # --- 鸡蛋 (使用 akshare 实时数据) ---
+    ef = egg_fundamentals or {}
+    ps = product_stats.get("egg", {})
+    pt = product_tech.get("egg", {})
+    pb = product_basis.get("egg", {})
+    if ps.get("close"):
+        egg_rows = [
+            ("期货收盘", f"{ps.get('close',0):.0f} 元/500kg"),
+            ("周涨跌", f"{ps.get('chg',0):+.0f} 元/500kg"),
+            ("鸡蛋现货", f"{ef.get('egg_spot','—')} 元/500kg" if ef.get('egg_spot') else "—"),
+            ("基差", f"{ef.get('egg_futures_basis',pb.get('basis',0)):+.0f} 元/500kg ({'升水' if float(ef.get('egg_futures_basis',0) or 0)>0 else '贴水'}{abs(float(ef.get('egg_futures_basis_rate',0) or 0))*100:.1f}%)" if (ef.get('egg_futures_basis') or pb) else "—"),
+            ("玉米价格", f"{ef.get('corn_price_kg','—')} 元/公斤"),
+            ("豆粕价格", f"{ef.get('soybean_price_kg','—')} 元/公斤"),
+            ("估算饲料成本", f"≈{ef.get('est_feed_cost','—')} 元/公斤" if ef.get('est_feed_cost') else "—"),
+            ("RSI(7)", f"{pt.get('rsi',0):.1f}"),
+            ("成交量/持仓", f"{pt.get('vol_total',0):.0f} / {pt.get('oi',0):.0f} 万手"),
+        ]
+        egg_basis = float(ef.get('egg_futures_basis', 0) or 0)
+        if egg_basis < -100:
+            egg_trend = "期货深贴水，现货偏强或近月供应偏紧，基差有收敛动力"
+        elif egg_basis > 100:
+            egg_trend = "期货升水偏高，市场预期远期供应收紧或成本上移"
+        else:
+            egg_trend = "期现基本平水，供需相对平衡，季节性波动为主"
+        egg_rows.append(("供需格局", egg_trend))
+
+        tbody = "".join(f"<tr><td class=\"row-name\">{r[0]}</td><td>{r[1]}</td></tr>" for r in egg_rows)
+        product_sd_html += f"""
+    <div class="section-title" style="margin-top:4px;">鸡蛋供需基本面<span class="en">Egg Fundamentals — JD</span></div>
+    <p style="font-size:10px;color:var(--muted);margin:0 0 4px 0;">
+      数据来源: 大商所 + 搜猪网(soozhu)饲料原料 &nbsp;|&nbsp; 饲料成本≈玉米×65%+豆粕×25%，占养殖成本70%+
+    </p>
+    <table class="data-table" style="max-width:500px;">
+      <thead><tr><th style="width:30%">指标</th><th>当前值</th></tr></thead>
+      <tbody>{tbody}</tbody>
+    </table>"""
+
+    # --- 豆粕 (技术面+大豆现货) ---
+    ps = product_stats.get("soymeal", {})
+    pt = product_tech.get("soymeal", {})
+    pb = product_basis.get("soymeal", {})
+    if ps.get("close"):
+        rows = [
+            ("期货收盘", f"{ps.get('close',0):.0f} 元/吨"),
+            ("周涨跌", f"{ps.get('chg',0):+.0f} 元/吨"),
+            ("大豆现货", f"{ps.get('soybean_spot',0):.0f} 元/吨" if ps.get('soybean_spot') else "—"),
+            ("RSI(7)", f"{pt.get('rsi',0):.1f} — {pt.get('rsi_signal','')}"),
+            ("成交量", f"{pt.get('vol_total',0):.0f} 万手"),
+            ("持仓量", f"{pt.get('oi',0):.0f} 万手"),
+            ("基差", f"{pb.get('basis',0):+.0f} 元/吨" if pb else "—"),
+            ("供需格局", "进口大豆集中到港或压制现货，饲料需求刚性支撑"),
+        ]
+        tbody = "".join(f"<tr><td class=\"row-name\">{r[0]}</td><td>{r[1]}</td></tr>" for r in rows)
+        product_sd_html += f"""
+    <div class="section-title" style="margin-top:4px;">豆粕供需基本面<span class="en">Soymeal Fundamentals — M</span></div>
+    <table class="data-table" style="max-width:500px;">
+      <thead><tr><th style="width:30%">指标</th><th>当前值</th></tr></thead>
+      <tbody>{tbody}</tbody>
     </table>"""
 
     # ── CFTC 基金持仓 ──
@@ -1714,7 +1913,12 @@ def build_html(stats, casde_data, usda_data, sales_df, weather_list, report_date
             for item in items[:5]:
                 news_html += f'<div style="font-size:11px;padding:2px 0;border-bottom:1px dotted #EEE;">'
                 news_html += f'<span style="color:#7F8C8D;">[{item["time"]}]</span> '
-                news_html += f'{item["title"]}'
+                title = item["title"]
+                url = item.get("url", "")
+                if url:
+                    news_html += f'<a href="{url}" target="_blank" style="color:#2C3E50;text-decoration:none;border-bottom:1px dotted #999;">{title}</a>'
+                else:
+                    news_html += f'{title}'
                 if item.get("source"):
                     news_html += f' <span style="color:#95A5A6;font-size:10px;">({item["source"]})</span>'
                 news_html += '</div>'
@@ -1791,6 +1995,8 @@ def build_html(stats, casde_data, usda_data, sales_df, weather_list, report_date
 
 {usda_html}
 
+{product_sd_html}
+
 {cftc_html}
 
 {sales_html}
@@ -1854,7 +2060,7 @@ def html_to_pdf(html_path: str, pdf_path: str):
         "--disable-gpu",
         "--no-sandbox",
         f"--print-to-pdf={pdf_abs}",
-        "--print-to-pdf-no-header",
+        "--no-pdf-header-footer",
         f"file:///{html_abs.replace(os.sep, '/')}",
     ]
     try:
@@ -1948,6 +2154,16 @@ def refresh_all_data():
     except Exception as e:
         print(f"SKIP (网络/解析异常, 使用已有数据)")
 
+    # 6. 生猪 & 鸡蛋供需基本面
+    try:
+        print("  [基本面] 拉取生猪+鸡蛋供需数据 ...")
+        sys.path.insert(0, str(ML_DIR))
+        from fetch_fundamentals import update_all_fundamentals
+        update_all_fundamentals()
+        updated.append("生猪+鸡蛋基本面已更新")
+    except Exception as e:
+        print(f"SKIP (基本面拉取异常: {e})")
+
     return updated
 
 
@@ -1994,8 +2210,14 @@ def main():
     soymeal_df = load_soymeal_futures()
     hog_idx_df = load_hog_index()
     soybean_spot_df = load_soybean_spot()
+    hog_fundamentals = load_hog_fundamentals()
+    egg_fundamentals = load_egg_fundamentals()
     print(f"  [OK] CFTC {len(cftc_df)} 现货 {len(soozhu_df)} BDI {len(freight_df)}")
     print(f"  [OK] 淀粉 {len(starch_df)} 鸡蛋 {len(egg_df)} 生猪 {len(hog_fut_df)} 豆粕 {len(soymeal_df)} 生猪指数 {len(hog_idx_df)}")
+    if hog_fundamentals:
+        print(f"  [OK] 生猪基本面: 均价{hog_fundamentals.get('hog_price_kg','?')}元/kg, 猪粮比{hog_fundamentals.get('hog_core','?')}")
+    if egg_fundamentals:
+        print(f"  [OK] 鸡蛋基本面: 现货{egg_fundamentals.get('egg_spot','?')}元/500kg, 基差率{egg_fundamentals.get('egg_futures_basis_rate','?')}")
 
     # 计算产品周度统计
     def product_weekly_stats(df):
@@ -2090,7 +2312,7 @@ def main():
     html = build_html(stats, casde_data, usda_data, sales_df, weather_list, report_date_str,
                       sales_chart_b64, cftc_chart_b64, spot_trend_b64, downstream_b64, freight_b64,
                       product_charts, hog_index_b64, news_data, product_stats, product_tech, product_basis,
-                      corn_tech)
+                      corn_tech, hog_fundamentals, egg_fundamentals)
 
     html_path = OUT_DIR / f"corn_weekly_report_{report_date_str}.html"
     html_path.write_text(html, encoding="utf-8")
